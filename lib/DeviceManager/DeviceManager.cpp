@@ -1,0 +1,857 @@
+// SPDX-FileCopyrightText: 2026 André Fiedler
+//
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#include <DeviceManager.h>
+#include <cstdio>
+#include <time.h>
+
+namespace
+{
+    constexpr uint32_t DEVICE_ID_INITIAL_DELAY_MS = 100;
+    constexpr uint32_t DEVICE_ID_RETRY_DELAY_MS = 250;
+    constexpr uint32_t DEVICE_ID_RESPONSE_TIMEOUT_MS = 12000;
+    constexpr uint8_t DEVICE_ID_MAX_RETRY = 4;
+    constexpr const char *DEVICE_KEEPALIVE_LINE = "Main loop is running.";
+
+    class StateLockGuard
+    {
+    public:
+        explicit StateLockGuard(SemaphoreHandle_t mutex)
+            : mutex_(mutex),
+              locked_(mutex_ && xSemaphoreTake(mutex_, portMAX_DELAY) == pdTRUE)
+        {
+        }
+
+        ~StateLockGuard()
+        {
+            if (locked_)
+                xSemaphoreGive(mutex_);
+        }
+
+    private:
+        SemaphoreHandle_t mutex_;
+        bool locked_;
+    };
+
+    String extractPayload(const String &trimmed, bool allowBareValue = false)
+    {
+        if (trimmed.startsWith("OK "))
+        {
+            String value = trimmed.substring(3);
+            value.trim();
+            return value;
+        }
+        if (allowBareValue)
+        {
+            String value = trimmed;
+            value.trim();
+            return value;
+        }
+        return String();
+    }
+
+    bool isStrictNumericString(const String &value, bool allowDecimal, bool allowSign = false)
+    {
+        if (!value.length())
+            return false;
+
+        bool sawDigit = false;
+        bool sawDecimal = false;
+        for (size_t i = 0; i < value.length(); ++i)
+        {
+            char c = value[i];
+            if (c >= '0' && c <= '9')
+            {
+                sawDigit = true;
+                continue;
+            }
+            if (allowDecimal && c == '.' && !sawDecimal)
+            {
+                sawDecimal = true;
+                continue;
+            }
+            if (allowSign && i == 0 && (c == '-' || c == '+'))
+                continue;
+            return false;
+        }
+        return sawDigit;
+    }
+
+    bool isUnsignedIntegerString(const String &value)
+    {
+        return isStrictNumericString(value, false, false);
+    }
+
+    bool isDecimalString(const String &value, bool allowSign = false)
+    {
+        return isStrictNumericString(value, true, allowSign);
+    }
+}
+
+DeviceManager *DeviceManager::instance_ = nullptr;
+
+void DeviceManager::HandleConnected()
+{
+    if (instance_)
+        instance_->onConnected();
+}
+
+void DeviceManager::HandleDisconnected()
+{
+    if (instance_)
+        instance_->onDisconnected();
+}
+
+void DeviceManager::HandleLine(const String &line)
+{
+    if (instance_)
+        instance_->onLine(line);
+}
+
+void DeviceManager::HandleRaw(const uint8_t *data, size_t len)
+{
+    if (instance_)
+        instance_->onRaw(data, len);
+}
+
+DeviceManager::DeviceManager(UsbCdcHost &host)
+    : host_(host)
+{
+    instance_ = this;
+    state_mutex_ = xSemaphoreCreateMutex();
+}
+
+void DeviceManager::begin(uint16_t vid, uint16_t pid)
+{
+    begin(std::vector<std::pair<uint16_t, uint16_t>>{{vid, pid}});
+}
+
+void DeviceManager::begin(const std::vector<std::pair<uint16_t, uint16_t>> &vid_pid_allowlist)
+{
+    StateLockGuard lock(state_mutex_);
+    instance_ = this;
+
+    host_.setDeviceCallbacks(&DeviceManager::HandleConnected, &DeviceManager::HandleDisconnected);
+    host_.setLineCallback(&DeviceManager::HandleLine);
+    host_.setRawCallback(&DeviceManager::HandleRaw);
+
+    host_.setVidPidFilters(vid_pid_allowlist);
+
+    enabled_ = false;
+    device_id_logged_ = false;
+    device_details_logged_ = false;
+    synchronizing_replies_ = false;
+    known_device_id_ = String();
+    awaiting_response_ = false;
+    has_current_command_ = false;
+    command_queue_.clear();
+}
+
+void DeviceManager::setRawLogging(bool enabled)
+{
+    raw_logging_enabled_ = enabled;
+}
+
+void DeviceManager::toggleRawLogging()
+{
+    raw_logging_enabled_ = !raw_logging_enabled_;
+}
+
+void DeviceManager::start()
+{
+    enable(true);
+}
+
+void DeviceManager::stop()
+{
+    enable(false);
+}
+
+void DeviceManager::enable(bool active)
+{
+    StateLockGuard lock(state_mutex_);
+    if (enabled_ == active)
+        return;
+
+    enabled_ = active;
+    synchronizing_replies_ = false;
+    known_device_id_ = String();
+
+    command_queue_.clear();
+    awaiting_response_ = false;
+    has_current_command_ = false;
+    device_id_logged_ = false;
+    device_details_logged_ = false;
+    current_command_ = PendingCommand{};
+
+    if (enabled_)
+    {
+        scheduleDeviceId(DEVICE_ID_INITIAL_DELAY_MS, true);
+        processQueue();
+    }
+}
+
+void DeviceManager::requestStats()
+{
+    StateLockGuard lock(state_mutex_);
+    if (!enabled_ || !host_.isConnected() || !device_id_logged_)
+        return;
+
+    if (!isCommandPending("GET devicePower") && (!awaiting_response_ || current_command_.command != "GET devicePower"))
+        enqueueCommand("GET devicePower", CommandType::DevicePower, 0, false);
+    if (!isCommandPending("GET tubePulseCount") && (!awaiting_response_ || current_command_.command != "GET tubePulseCount"))
+        enqueueCommand("GET tubePulseCount", CommandType::TubePulseCount, 0, false);
+    if (!isCommandPending("GET tubeRate") && (!awaiting_response_ || current_command_.command != "GET tubeRate"))
+        enqueueCommand("GET tubeRate", CommandType::TubeRate, 0, false);
+    if (!isCommandPending("GET deviceBatteryVoltage") && (!awaiting_response_ || current_command_.command != "GET deviceBatteryVoltage"))
+        enqueueCommand("GET deviceBatteryVoltage", CommandType::DeviceBatteryVoltage, 0, false);
+
+    processQueue();
+}
+
+void DeviceManager::requestRandomData()
+{
+    StateLockGuard lock(state_mutex_);
+    if (!enabled_ || !host_.isConnected() || synchronizing_replies_)
+        return;
+    if (!isCommandPending("GET randomData"))
+        enqueueCommand("GET randomData", CommandType::RandomData, 0, true);
+    processQueue();
+}
+
+void DeviceManager::requestDataLog(const String &args)
+{
+    StateLockGuard lock(state_mutex_);
+    if (!enabled_ || !host_.isConnected() || synchronizing_replies_)
+        return;
+    String cmd = "GET datalog";
+    if (args.length())
+    {
+        cmd += " ";
+        cmd += args;
+    }
+    enqueueCommand(cmd, CommandType::DataLog, 0, true);
+    processQueue();
+}
+
+void DeviceManager::loop()
+{
+    StateLockGuard lock(state_mutex_);
+    if (!enabled_)
+        return;
+
+    if (!host_.isConnected())
+    {
+        if (line_handler_ && (awaiting_response_ || has_current_command_ || !command_queue_.empty()))
+        {
+            line_handler_(String("USB not connected; clearing pending commands. queued=") + command_queue_.size());
+        }
+        awaiting_response_ = false;
+        has_current_command_ = false;
+        current_command_ = PendingCommand{};
+        command_queue_.clear();
+        return;
+    }
+
+    if (awaiting_response_)
+    {
+        if (!has_current_command_ || !current_command_.command.length())
+        {
+            awaiting_response_ = false;
+            has_current_command_ = false;
+            current_command_ = PendingCommand{};
+            processQueue();
+            return;
+        }
+
+        if ((millis() - last_request_ms_) > DEVICE_ID_RESPONSE_TIMEOUT_MS)
+        {
+            if (line_handler_)
+            {
+                String cmdLabel = current_command_.command.length()
+                                      ? current_command_.command
+                                      : String("type=") + String(static_cast<int>(current_command_.type));
+                line_handler_(String("Command timeout: ") + cmdLabel + " retry=" + current_command_.retry);
+            }
+
+            if (current_command_.type == CommandType::DeviceId && !device_id_logged_ && current_command_.retry == 0 && !initial_deviceid_recovery_done_)
+            {
+                // First DeviceId timeout immediately after attach: force a single host restart to re-enumerate cleanly.
+                initial_deviceid_recovery_done_ = true;
+                if (line_handler_)
+                    line_handler_(synchronizing_replies_
+                        ? String("USB reply synchronization timed out; restarting USB host once.")
+                        : String("DeviceId timed out immediately after attach; restarting USB host once."));
+                awaiting_response_ = false;
+                has_current_command_ = false;
+                command_queue_.clear();
+                current_command_ = PendingCommand{};
+                host_.restart();
+                return;
+            }
+            if (current_command_.type == CommandType::DeviceId)
+                handleError();
+            else
+                synchronizeReplies();
+        }
+        return;
+    }
+
+    processQueue();
+}
+
+void DeviceManager::onConnected()
+{
+    StateLockGuard lock(state_mutex_);
+    synchronizing_replies_ = false;
+    known_device_id_ = String();
+    device_id_logged_ = false;
+    device_details_logged_ = false;
+    initial_deviceid_recovery_done_ = false;
+    awaiting_response_ = false;
+    has_current_command_ = false;
+    command_queue_.clear();
+    current_command_ = PendingCommand{};
+
+    if (enabled_)
+        scheduleDeviceId(DEVICE_ID_INITIAL_DELAY_MS, true);
+
+    if (line_handler_)
+    {
+        char buf[80];
+        snprintf(buf, sizeof(buf), "USB device CONNECTED (VID=0x%04X PID=0x%04X)",
+                 host_.connectedVid(), host_.connectedPid());
+        line_handler_(String(buf));
+    }
+
+    processQueue();
+}
+
+void DeviceManager::onDisconnected()
+{
+    StateLockGuard lock(state_mutex_);
+    synchronizing_replies_ = false;
+    known_device_id_ = String();
+    device_id_logged_ = false;
+    device_details_logged_ = false;
+    awaiting_response_ = false;
+    has_current_command_ = false;
+    current_command_ = PendingCommand{};
+    command_queue_.clear();
+    device_sensitivity_cpm_per_uSv_ = 0.0f;
+
+    if (enabled_)
+        scheduleDeviceId(DEVICE_ID_INITIAL_DELAY_MS, true);
+
+    if (line_handler_)
+        line_handler_(String("USB device DISCONNECTED"));
+}
+
+void DeviceManager::onLine(const String &line)
+{
+    StateLockGuard lock(state_mutex_);
+    if (verbose_logging_enabled_ && line_handler_)
+        line_handler_(String("<- Line: ") + line);
+
+    if (!awaiting_response_ || !has_current_command_)
+        return;
+
+    String trimmed = line;
+    trimmed.trim();
+
+    if (trimmed.equalsIgnoreCase(DEVICE_KEEPALIVE_LINE))
+        return;
+
+    if (trimmed.equalsIgnoreCase("ERROR"))
+    {
+        // An error may also belong to the timed-out command. Only an identity
+        // reply establishes a new boundary while resynchronizing.
+        if (!synchronizing_replies_)
+            handleError();
+        return;
+    }
+
+    switch (current_command_.type)
+    {
+    case CommandType::DeviceModel:
+    case CommandType::DeviceFirmware:
+    case CommandType::DeviceLocale:
+    case CommandType::DeviceBatteryPercent:
+    case CommandType::TubeDoseRate:
+        handleSuccess();
+        break;
+    case CommandType::DeviceId:
+    {
+        if (!trimmed.startsWith("OK "))
+            return;
+
+        String payload = trimmed.substring(3);
+        int firstSemi = payload.indexOf(';');
+        int secondSemi = (firstSemi >= 0) ? payload.indexOf(';', firstSemi + 1) : -1;
+        String deviceId;
+
+        // Numeric OK replies are not identity responses and must never release
+        // the synchronization barrier, including during initial connection.
+        if (firstSemi <= 0)
+            return;
+        deviceId = payload.substring(secondSemi > firstSemi ? secondSemi + 1 : firstSemi + 1);
+        deviceId.trim();
+        if (!deviceId.length() ||
+            (synchronizing_replies_ && known_device_id_.length() && deviceId != known_device_id_))
+            return;
+
+        if (synchronizing_replies_ && line_handler_)
+            line_handler_(String("USB reply synchronization complete; detector identity verified."));
+        synchronizing_replies_ = false;
+        known_device_id_ = deviceId;
+
+        if (!device_id_logged_ && line_handler_)
+            line_handler_(String("Device ID: ") + deviceId);
+        device_id_logged_ = true;
+        emitResult(CommandType::DeviceId, deviceId, true);
+
+        if (!device_details_logged_)
+        {
+            String model;
+            String firmware;
+            String locale;
+
+            if (firstSemi > 0)
+            {
+                model = payload.substring(0, firstSemi);
+                model.trim();
+            }
+
+            if (secondSemi > firstSemi && secondSemi > 0)
+            {
+                String firmwareLocale = payload.substring(firstSemi + 1, secondSemi);
+                firmwareLocale.trim();
+                int slash = firmwareLocale.indexOf('/');
+                if (slash >= 0)
+                {
+                    firmware = firmwareLocale.substring(0, slash);
+                    firmware.trim();
+                    locale = firmwareLocale.substring(slash + 1);
+                    locale.trim();
+                }
+                else
+                {
+                    firmware = firmwareLocale;
+                }
+            }
+
+            if (line_handler_)
+            {
+                if (model.length())
+                    line_handler_(String("Device Model: ") + model);
+                if (firmware.length())
+                    line_handler_(String("Firmware: ") + firmware);
+                if (locale.length())
+                    line_handler_(String("Locale: ") + locale);
+            }
+
+            if (model.length())
+                emitResult(CommandType::DeviceModel, model, true);
+            if (firmware.length())
+                emitResult(CommandType::DeviceFirmware, firmware, true);
+            if (locale.length())
+                emitResult(CommandType::DeviceLocale, locale, true);
+
+            device_details_logged_ = true;
+        }
+
+        enqueueCommand("GET devicePower", CommandType::DevicePower, 0, true);
+        enqueueCommand("GET deviceBatteryVoltage", CommandType::DeviceBatteryVoltage, 0, true);
+        enqueueCommand("GET deviceTime", CommandType::DeviceTime, 0, true);
+        enqueueCommand("GET deviceTimeZone", CommandType::DeviceTimeZone, 0, true);
+        enqueueCommand("GET tubeTime", CommandType::TubeTime, 0, true);
+        enqueueCommand("GET tubeSensitivity", CommandType::DeviceSensitivity, 0, true);
+        enqueueCommand("GET tubeDeadTime", CommandType::TubeDeadTime, 0, true);
+        enqueueCommand("GET tubeDeadTimeCompensation", CommandType::TubeDeadTimeCompensation, 0, true);
+
+        handleSuccess();
+        break;
+    }
+    case CommandType::DevicePower:
+    {
+        String value = extractPayload(trimmed);
+        if (value != "0" && value != "1")
+            return;
+        if (line_handler_)
+            line_handler_(String("Device Power: ") + (value == "1" ? "ON" : "OFF"));
+        emitResult(CommandType::DevicePower, value, true);
+        handleSuccess();
+        break;
+    }
+    case CommandType::DeviceBatteryVoltage:
+    {
+        String value = extractPayload(trimmed);
+        if (!isDecimalString(value))
+            return;
+        if (line_handler_)
+            line_handler_(String("Battery Voltage: ") + value + " V");
+        emitResult(CommandType::DeviceBatteryVoltage, value, true);
+
+        float voltage = value.toFloat();
+        float percent = (voltage - 3.0f) * (100.0f / (4.2f - 3.0f));
+        if (percent < 0.0f)
+            percent = 0.0f;
+        if (percent > 100.0f)
+            percent = 100.0f;
+        uint8_t percentInt = static_cast<uint8_t>(percent + 0.5f);
+        if (line_handler_)
+            line_handler_(String("Battery Percent: ") + percentInt + " %");
+        emitResult(CommandType::DeviceBatteryPercent, String(percentInt), true);
+        handleSuccess();
+        break;
+    }
+    case CommandType::DeviceTime:
+    {
+        String value = extractPayload(trimmed);
+        if (!isUnsignedIntegerString(value))
+            return;
+        if (line_handler_)
+        {
+            time_t ts = static_cast<time_t>(value.toInt());
+            struct tm tm_info;
+            gmtime_r(&ts, &tm_info);
+            char buf[32];
+            strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S UTC", &tm_info);
+            line_handler_(String("Device Time: ") + buf + " (" + value + ")");
+        }
+        emitResult(CommandType::DeviceTime, value, true);
+        handleSuccess();
+        break;
+    }
+    case CommandType::DeviceTimeZone:
+    {
+        String zone = extractPayload(trimmed);
+        if (!isDecimalString(zone, true))
+            return;
+        if (line_handler_)
+            line_handler_(String("Device Time Zone: ") + zone);
+        emitResult(CommandType::DeviceTimeZone, zone, true);
+        handleSuccess();
+        break;
+    }
+    case CommandType::DeviceSensitivity:
+    {
+        String sens = extractPayload(trimmed);
+        if (!isDecimalString(sens))
+            return;
+        if (line_handler_)
+            line_handler_(String("Tube Sensitivity: ") + sens + " cpm/µSv/h");
+        emitResult(CommandType::DeviceSensitivity, sens, true);
+        device_sensitivity_cpm_per_uSv_ = sens.toFloat();
+        handleSuccess();
+        break;
+    }
+    case CommandType::TubeTime:
+    {
+        String value = extractPayload(trimmed);
+        if (!isUnsignedIntegerString(value))
+            return;
+        if (line_handler_)
+            line_handler_(String("Tube Lifetime: ") + value + " s");
+        emitResult(CommandType::TubeTime, value, true);
+        handleSuccess();
+        break;
+    }
+    case CommandType::TubePulseCount:
+    {
+        String value = extractPayload(trimmed, true);
+        if (!isUnsignedIntegerString(value))
+            return;
+        if (line_handler_)
+            line_handler_(String("Tube Pulse Count: ") + value);
+        emitResult(CommandType::TubePulseCount, value, true);
+        handleSuccess();
+        break;
+    }
+    case CommandType::TubeRate:
+    {
+        String value = extractPayload(trimmed, true);
+        if (!isDecimalString(value))
+            return;
+        if (line_handler_)
+            line_handler_(String("Tube Rate: ") + value + " cpm");
+        emitResult(CommandType::TubeRate, value, true);
+
+        float rate = value.toFloat();
+        if (rate >= 0.0f)
+        {
+            float sensitivity = device_sensitivity_cpm_per_uSv_;
+            if (sensitivity > 0.0f)
+            {
+                float dose = rate / sensitivity;
+                if (line_handler_)
+                    line_handler_(String("Dose Rate: ") + String(dose, 5) + " µSv/h");
+                emitResult(CommandType::TubeDoseRate, String(dose, 5), true);
+            }
+        }
+        handleSuccess();
+        break;
+    }
+    case CommandType::TubeDeadTime:
+    {
+        String value = extractPayload(trimmed);
+        if (!isDecimalString(value))
+            return;
+        if (line_handler_)
+            line_handler_(String("Tube Dead Time: ") + value + " s");
+        emitResult(CommandType::TubeDeadTime, value, true);
+        handleSuccess();
+        break;
+    }
+    case CommandType::TubeDeadTimeCompensation:
+    {
+        String value = extractPayload(trimmed);
+        if (!isDecimalString(value))
+            return;
+        if (line_handler_)
+            line_handler_(String("Dead Time Compensation: ") + value + " s");
+        emitResult(CommandType::TubeDeadTimeCompensation, value, true);
+        handleSuccess();
+        break;
+    }
+    case CommandType::TubeHVFrequency:
+    {
+        String value = extractPayload(trimmed);
+        if (!isDecimalString(value))
+            return;
+        if (line_handler_)
+            line_handler_(String("HV Frequency: ") + value + " Hz");
+        emitResult(CommandType::TubeHVFrequency, value, true);
+        handleSuccess();
+        break;
+    }
+    case CommandType::TubeHVDutyCycle:
+    {
+        String value = extractPayload(trimmed);
+        if (!isDecimalString(value))
+            return;
+        if (line_handler_)
+            line_handler_(String("HV Duty Cycle: ") + value);
+        emitResult(CommandType::TubeHVDutyCycle, value, true);
+        handleSuccess();
+        break;
+    }
+    case CommandType::RandomData:
+    {
+        if (trimmed.startsWith("OK "))
+        {
+            String value = trimmed.substring(3);
+            value.trim();
+            if (line_handler_)
+                line_handler_(String("Random Data: ") + value);
+            emitResult(CommandType::RandomData, value, true);
+        }
+        handleSuccess();
+        break;
+    }
+    case CommandType::DataLog:
+    {
+        if (trimmed.startsWith("OK "))
+        {
+            String value = trimmed.substring(3);
+            if (line_handler_)
+                line_handler_(String("Data Log: ") + value);
+            emitResult(CommandType::DataLog, value, true);
+        }
+        handleSuccess();
+        break;
+    }
+    case CommandType::Generic:
+    {
+        if (line_handler_)
+            line_handler_(String("") + current_command_.command + " -> " + trimmed);
+        handleSuccess();
+        break;
+    }
+    }
+}
+
+void DeviceManager::onRaw(const uint8_t *data, size_t len)
+{
+    if (!raw_logging_enabled_ || !raw_handler_)
+        return;
+    raw_handler_(data, len);
+}
+
+void DeviceManager::scheduleDeviceId(uint32_t delay_ms, bool announce)
+{
+    enqueueCommand("GET deviceId", CommandType::DeviceId, delay_ms, announce);
+}
+
+void DeviceManager::enqueueCommand(const String &cmd, CommandType type, uint32_t delay_ms, bool announce)
+{
+    PendingCommand entry;
+    entry.command = cmd;
+    entry.type = type;
+    entry.announce = announce;
+    entry.ready_ms = millis() + delay_ms;
+    command_queue_.push_back(entry);
+}
+
+bool DeviceManager::isCommandPending(const String &cmd) const
+{
+    if (has_current_command_ && current_command_.command == cmd)
+        return true;
+    for (const auto &entry : command_queue_)
+    {
+        if (entry.command == cmd)
+            return true;
+    }
+    return false;
+}
+
+void DeviceManager::processQueue()
+{
+    if (awaiting_response_ || has_current_command_)
+        return;
+
+    if (command_queue_.empty())
+        return;
+
+    unsigned long now = millis();
+    for (auto it = command_queue_.begin(); it != command_queue_.end(); ++it)
+    {
+        if (synchronizing_replies_ && it->type != CommandType::DeviceId)
+            continue;
+        if (static_cast<long>(now - it->ready_ms) >= 0)
+        {
+            current_command_ = *it;
+            command_queue_.erase(it);
+            has_current_command_ = true;
+            issueCurrentCommand();
+            break;
+        }
+    }
+}
+
+void DeviceManager::issueCurrentCommand()
+{
+    if (!has_current_command_ || !host_.isConnected())
+        return;
+
+    if (current_command_.announce && verbose_logging_enabled_ && line_handler_)
+        line_handler_(String("-> Queue: ") + current_command_.command);
+
+    // Diagnostic only: restore the v0.6.01 identity probe sequence to test
+    // whether the GC-800 requires a different command terminator immediately
+    // after USB attach. Other commands remain single-request transactions.
+    if (current_command_.type == CommandType::DeviceId)
+    {
+        host_.sendCommand(current_command_.command, true);
+        host_.sendCommand(current_command_.command + "\n", false);
+        host_.sendCommand(current_command_.command + "\r", false);
+    }
+    else
+    {
+        host_.sendCommand(current_command_.command, true);
+    }
+
+    awaiting_response_ = true;
+    last_request_ms_ = millis();
+}
+
+void DeviceManager::handleSuccess()
+{
+    awaiting_response_ = false;
+    has_current_command_ = false;
+    current_command_ = PendingCommand{};
+    processQueue();
+}
+
+void DeviceManager::synchronizeReplies()
+{
+    const CommandType failedType = current_command_.type;
+    awaiting_response_ = false;
+    has_current_command_ = false;
+    current_command_ = PendingCommand{};
+    command_queue_.clear();
+    device_id_logged_ = false;
+    device_details_logged_ = false;
+    device_sensitivity_cpm_per_uSv_ = 0.0f;
+    synchronizing_replies_ = true;
+    if (line_handler_)
+        line_handler_(String("USB reply synchronization lost; discarding late replies until detector identity is verified."));
+    emitResult(failedType, String(), false);
+    // The serial stream is ordered. The distinctive identity response comes
+    // after the expired command's replies; never advance through numeric
+    // commands by guessing which late OK value belongs to which request.
+    scheduleDeviceId(DEVICE_ID_RETRY_DELAY_MS, true);
+    processQueue();
+}
+
+void DeviceManager::handleError()
+{
+    awaiting_response_ = false;
+    bool retryScheduled = false;
+
+    if (!has_current_command_ || !current_command_.command.length())
+    {
+        has_current_command_ = false;
+        current_command_ = PendingCommand{};
+        processQueue();
+        return;
+    }
+
+    // If the device dropped mid-command, just reset state quietly.
+    if (!host_.isConnected())
+    {
+        has_current_command_ = false;
+        current_command_ = PendingCommand{};
+        command_queue_.clear();
+        return;
+    }
+
+    if (current_command_.type == CommandType::DeviceId && current_command_.retry < DEVICE_ID_MAX_RETRY)
+    {
+        PendingCommand retry = current_command_;
+        retry.retry++;
+        retry.ready_ms = millis() + DEVICE_ID_RETRY_DELAY_MS;
+        command_queue_.insert(command_queue_.begin(), retry);
+        retryScheduled = true;
+        if (line_handler_)
+        {
+            line_handler_(String("Retrying DeviceId (attempt ") + String(retry.retry + 1) + "/" + String(DEVICE_ID_MAX_RETRY + 1) + ")");
+        }
+    }
+    else if ((current_command_.type == CommandType::TubePulseCount || current_command_.type == CommandType::TubeRate ||
+              current_command_.type == CommandType::DevicePower ||
+              current_command_.type == CommandType::DeviceBatteryVoltage || current_command_.type == CommandType::DeviceBatteryPercent) &&
+             current_command_.retry < 1)
+    {
+        PendingCommand retry = current_command_;
+        retry.retry++;
+        retry.ready_ms = millis() + DEVICE_ID_RETRY_DELAY_MS;
+        command_queue_.push_back(retry);
+        retryScheduled = true;
+    }
+    else if (line_handler_ && device_id_logged_ &&
+             current_command_.type != CommandType::TubePulseCount &&
+             current_command_.type != CommandType::TubeRate &&
+             current_command_.type != CommandType::DevicePower &&
+             current_command_.type != CommandType::DeviceBatteryVoltage &&
+             current_command_.type != CommandType::DeviceBatteryPercent)
+    {
+        line_handler_(String("Command failed: ") + current_command_.command);
+    }
+
+    if (!retryScheduled)
+        emitResult(current_command_.type, String(), false);
+
+    has_current_command_ = false;
+    current_command_ = PendingCommand{};
+    processQueue();
+}
+
+void DeviceManager::emitResult(CommandType type, const String &value, bool success)
+{
+    if (command_result_handler_)
+    {
+        command_result_handler_(type, value, success);
+    }
+}

@@ -1,0 +1,187 @@
+/*
+ * SPDX-FileCopyrightText: 2026 André Fiedler
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
+#pragma once
+#include <Arduino.h>
+#include <atomic>
+#include <utility>
+#include <vector>
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+#include "esp_err.h"
+#include "esp_intr_alloc.h"
+#include "UsbAttachDelayPolicy.h"
+#include "UsbDiagnosticMessages.h"
+
+extern "C"
+{
+#include "usb/usb_host.h"
+#include "usb/cdc_acm_host.h"
+#include "usb/usb_types_stack.h" // usb_device_desc_t
+}
+
+class UsbCdcHost
+{
+public:
+    using DeviceCb = void (*)();
+    using LineCb = void (*)(const String &line);
+    using RawCb = void (*)(const uint8_t *data, size_t len);
+
+    UsbCdcHost();
+    ~UsbCdcHost();
+
+    // Lifecycle
+    bool begin();
+    void stop();
+
+    // Safe from any task: enqueues TX
+    bool sendCommand(const String &cmd, bool append_crlf = true, uint32_t timeout_ms = 1000);
+    bool sendLine(const String &line, uint32_t timeout_ms = 1000);
+    bool send(const uint8_t *data, size_t len, uint32_t timeout_ms = 1000);
+
+    // Line coding (ignored if device doesn’t support it)
+    bool setBaud(uint32_t baud);
+    // Exclusive, synchronous binary transport for the ROM firmware updater.
+    bool beginFirmwareSession();
+    void endFirmwareSession();
+    bool firmwareWrite(const uint8_t *data, size_t len);
+    bool firmwareRead(uint8_t *data, size_t len, uint32_t timeout_ms);
+    void firmwareDrain();
+    bool setFirmwareLineCoding(uint32_t baud, bool evenParity);
+    bool setFirmwareSignals(bool dtr, bool rts);
+    uint32_t connectionGeneration() const { return connection_generation_.load(); }
+    bool restart();
+    bool requestRestart();
+    bool restartRunsInBackground() const { return true; }
+
+    // App callbacks
+    void setDeviceCallbacks(DeviceCb on_connected, DeviceCb on_disconnected);
+    void setLineCallback(LineCb on_line);
+    void setRawCallback(RawCb cb);
+    void setDebugSink(Print *sink) { debug_sink_ = sink; }
+
+    // Optional: restrict to specific VID/PID pairs (empty list = ANY)
+    void setVidPidFilter(uint16_t vid, uint16_t pid);           // legacy single filter
+    void setVidPidFilters(const std::vector<std::pair<uint16_t, uint16_t>> &filters);
+    void clearVidPidFilters();
+    void addVidPidFilter(uint16_t vid, uint16_t pid);
+
+    // Status
+    bool isConnected() const { return running_ && connected_ && !disconnect_pending_; }
+    bool hasObservedDevice() const { return observed_device_seq_ != 0 || isConnected(); }
+    unsigned long observationReadyAtMs() const { return observed_device_ready_ms_; }
+    uint16_t connectedVid() const { return connected_vid_; }
+    uint16_t connectedPid() const { return connected_pid_; }
+    esp_err_t lastError() const { return last_err_; }
+
+private:
+    // Tasks
+    static void UsbLibTaskThunk(void *arg);
+    static void CdcTaskThunk(void *arg);
+    static void TxTaskThunk(void *arg);
+    static void RestartTaskThunk(void *arg);
+
+    void usbLibTask();
+    void cdcTask();
+    void txTask();
+    void restartTask();
+    bool closeDeviceHandles();
+
+    // CDC callbacks
+    static bool DataCb(const uint8_t *data, size_t len, void *user_arg);
+    static void DevEventCb(const cdc_acm_host_dev_event_data_t *event, void *user_arg);
+
+    bool onRx(const uint8_t *data, size_t len);
+    void onDevEvent(const cdc_acm_host_dev_event_data_t *event);
+
+    // Helpers
+    esp_err_t configureLineCoding(uint32_t baud);
+    bool enqueueRaw(const uint8_t *data, size_t len, uint32_t timeout_ms);
+    void emitDebugLine(const String &line);
+    bool matchesAllowlist(uint16_t vid, uint16_t pid) const;
+    uint16_t resolvedVid(uint16_t requestedVid) const;
+    uint16_t resolvedPid(uint16_t requestedPid) const;
+
+    static constexpr const char *TAG = "UsbCdcHost";
+
+    TaskHandle_t lib_task_ = nullptr;
+    TaskHandle_t cdc_task_ = nullptr;
+    TaskHandle_t tx_task_ = nullptr;
+    TaskHandle_t restart_task_ = nullptr;
+
+    cdc_acm_dev_hdl_t dev_ = nullptr;
+
+    uint32_t target_baud_ = 115200;
+    std::atomic<bool> running_{false};
+    std::atomic<bool> connected_{false};
+    std::atomic<bool> restart_requested_{false};
+    std::atomic<bool> disconnect_pending_{false};
+    std::atomic<bool> daemon_running_{false};
+    std::atomic<bool> lib_stopped_{true}, cdc_stopped_{true}, tx_stopped_{true}, dbg_stopped_{true};
+    bool host_installed_ = false;
+    BaseType_t host_core_ = 0; // Interrupt allocation and teardown must use the same core.
+    uint8_t opened_intf_idx_ = 0xFF; // which CDC interface we opened (for logs)
+
+    // Callbacks
+    DeviceCb on_connected_ = nullptr;
+    DeviceCb on_disconnected_ = nullptr;
+    LineCb on_line_ = nullptr;
+    RawCb on_raw_ = nullptr;
+    Print *debug_sink_ = nullptr;
+
+    // RX line buffer
+    String line_buf_;
+    volatile TickType_t last_rx_tick_ = 0;
+
+    // TX queue + mutex
+    struct TxItem
+    {
+        char *data;
+        size_t len;
+        uint32_t timeout_ms;
+    };
+    QueueHandle_t tx_q_ = nullptr;
+    SemaphoreHandle_t tx_mutex_ = nullptr;
+    QueueHandle_t firmware_rx_ = nullptr;
+    std::atomic<bool> firmware_mode_{false};
+    std::atomic<bool> firmware_rx_overflow_{false};
+    std::atomic<uint32_t> connection_generation_{0};
+
+    struct VidPid
+    {
+        uint16_t vid;
+        uint16_t pid;
+    };
+    std::vector<VidPid> allowed_devices_;
+
+    uint16_t connected_vid_ = 0;
+    uint16_t connected_pid_ = 0;
+    esp_err_t last_err_ = ESP_OK;
+
+    // Post-connect settle time for first TX
+    volatile TickType_t ready_after_tick_ = 0;
+
+    // VCP wrapper state (when using the VCP service for CH34x/CP210x/FTDI)
+    bool use_vcp_ = false;
+    CdcAcmDevice *vcp_dev_ = nullptr; // returned by VCP::open(); owned by this host
+
+    // Descriptor logging client
+    usb_host_client_handle_t dbg_client_ = nullptr;
+    TaskHandle_t dbg_task_ = nullptr;
+    volatile uint8_t last_observed_addr_ = 0;
+    volatile uint16_t last_observed_vid_ = 0;
+    volatile uint16_t last_observed_pid_ = 0;
+    volatile uint8_t last_observed_class_ = 0;
+    volatile unsigned long observed_device_ready_ms_ = 0;
+    volatile uint32_t observed_device_seq_ = 0;
+    volatile uint32_t reported_open_failure_seq_ = 0;
+    static void DbgClientTaskThunk(void *arg);
+    static void DbgClientCb(const usb_host_client_event_msg_t *evt, void *arg);
+    void dbgClientTask();
+};
