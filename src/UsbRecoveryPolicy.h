@@ -1,0 +1,43 @@
+/*
+ * SPDX-FileCopyrightText: 2026 André Fiedler
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
+#pragma once
+
+namespace UsbRecoveryPolicy
+{
+constexpr unsigned long kDisconnectGraceMs = 15000UL;
+constexpr unsigned long kRestartIntervalMs = 30000UL;
+
+inline bool shouldRestart(unsigned long now,
+                          unsigned long disconnectedSinceMs,
+                          unsigned long lastRestartAttemptMs,
+                          bool usbDeviceObserved,
+                          bool restartRunsInBackground,
+                          unsigned long observationReadyAtMs = 0)
+{
+    (void)restartRunsInBackground;
+
+    if (!usbDeviceObserved)
+        return false;
+
+    if (disconnectedSinceMs == 0)
+        return false;
+
+    // A detector plugged in long after boot still needs time to finish opening.
+    if (observationReadyAtMs != 0 &&
+        static_cast<long>(now - observationReadyAtMs) < static_cast<long>(kDisconnectGraceMs))
+        return false;
+
+    if (static_cast<long>(now - disconnectedSinceMs) < static_cast<long>(kDisconnectGraceMs))
+        return false;
+
+    if (lastRestartAttemptMs != 0 &&
+        static_cast<long>(now - lastRestartAttemptMs) < static_cast<long>(kRestartIntervalMs))
+        return false;
+
+    return true;
+}
+} // namespace UsbRecoveryPolicy

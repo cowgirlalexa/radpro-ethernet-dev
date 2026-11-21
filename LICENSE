@@ -1,0 +1,26 @@
+# License
+
+This repository uses REUSE-style license metadata. The full public license
+texts are stored in the `LICENSES/` directory, and individual files are marked
+with SPDX headers or `.reuse/dep5` metadata.
+
+Original firmware, source code, build scripts, web portal code, generated
+firmware images, and related software assets are licensed under:
+
+`GPL-3.0-or-later`
+
+Documentation, tutorials, diagrams, screenshots, and non-code media are
+licensed under:
+
+`CC-BY-SA-4.0`
+
+Case and hardware design files are licensed under:
+
+`CERN-OHL-S-2.0`
+
+Bundled third-party components keep their own licenses and copyright notices.
+See the license files and SPDX metadata in the corresponding third-party
+directories, including `components/` and `data/portal/js/jszip.min.js`.
+
+For closed-source, proprietary, or otherwise GPL-incompatible use, see
+`COMMERCIAL-LICENSE.md`.
