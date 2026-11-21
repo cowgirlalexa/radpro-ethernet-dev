@@ -1,0 +1,233 @@
+/*
+ * SPDX-FileCopyrightText: 2026 André Fiedler
+ *
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
+#pragma once
+
+#include <WiFi.h>
+#include <ETH.h>
+#include <WebServer.h>
+#include <WiFiManager.h>
+#include <esp_wifi_types.h>
+#include <ping/ping_sock.h>
+#include <vector>
+#include <functional>
+#include <initializer_list>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include "DeviceInfo/DeviceInfoStore.h"
+#include "DeviceInfo/DeviceInfoPage.h"
+#include "DeviceInfo/BridgeInfoPage.h"
+#include "AppConfig/AppConfig.h"
+#include "Led/LedController.h"
+#include "Ota/OtaUpdateService.h"
+#include "Logging/DebugLogStream.h"
+#include "Publishing/PublisherHealth.h"
+#include "ConfigPortal/WiFiReconnectPolicy.h"
+
+class SafecastPublisher;
+class RadProUpdateService;
+
+class WiFiPortalService
+{
+public:
+    using TemplateReplacements = std::vector<std::pair<String, String>>;
+
+    WiFiPortalService(AppConfig &config,
+                      AppConfigStore &store,
+                      DeviceInfoStore &info,
+                      DebugLogStream &logPort,
+                      LedController &led,
+                      const PublisherHealth &openSenseMapHealth,
+                      const PublisherHealth &gmcMapHealth,
+                      const PublisherHealth &radmonHealth,
+                      const PublisherHealth &openRadiationHealth,
+                      const PublisherHealth &safecastHealth);
+
+    void begin();
+    bool connect(bool forcePortal);
+    bool networkConnected() const;
+    bool usingEthernet() const;
+    IPAddress networkIP() const;
+    void maintain();
+    void process();
+    void syncIfRequested();
+    void dumpStatus();
+    void enableStatusLogging();
+    void setOtaStartCallback(std::function<void()> cb);
+    void setSafecastPublisher(SafecastPublisher &publisher);
+    void setRadProUpdater(RadProUpdateService &updater) { radProUpdater_ = &updater; }
+
+private:
+    void prepareConfigPortalAp(const String &ssid);
+    void initializeWiFiManager();
+    void initializeEthernet();
+    bool waitForPreferredEthernet();
+    void maintainEthernet();
+    void startEthernetPortal();
+    void stopEthernetPortal();
+    WebServer *activeServer();
+    WebServer *activeServer() const;
+    void registerPortalRoutes();
+    void sendEthernetMainMenu();
+    friend class MqttPublisher;
+    friend class OpenSenseMapPublisher;
+    friend class RadmonPublisher;
+    friend class GmcMapPublisher;
+    friend class SafecastPublisher;
+
+    void refreshParameters();
+    void attachParameters();
+    void handleWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info);
+    void logStatusIfNeeded();
+    void logConnectionDetails(const IPAddress &ip, const IPAddress &gateway, const IPAddress &mask);
+    void logStatus();
+    void attemptReconnect();
+    void maintainGatewayMonitor(bool connected);
+    bool startGatewayProbe(const IPAddress &gateway, unsigned long now);
+    void resetGatewayMonitor(const IPAddress &gateway = IPAddress());
+    static void onGatewayPingSuccess(esp_ping_handle_t handle, void *args);
+    static void onGatewayPingTimeout(esp_ping_handle_t handle, void *args);
+    static void onGatewayPingEnd(esp_ping_handle_t handle, void *args);
+    void sendOpenRadiationForm(const String &message = String());
+    void handleOpenRadiationPost();
+    void handleOpenRadiationDryRun();
+    void handleOpenRadiationLatest();
+    void sendSafecastForm(const AppConfig &viewConfig,
+                          const String &message = String(),
+                          const String &resultHtml = String());
+    void handleSafecastPost();
+    void sendConfigBackupPage(const String &message = String());
+    void sendUsbRecoveryForm(const char *noticeKey = nullptr, bool error = false);
+    void handleUsbRecoveryPost();
+    void handleConfigDownload();
+    void handleConfigRestore();
+    String exportConfigJson() const;
+    bool importConfigJson(const String &body, String &errorMessage);
+    static String htmlEscape(const String &value);
+    void sendOtaPage(const String &message = String());
+    void registerRadProUpdateRoutes();
+    bool sendTemplate(const char *path, const TemplateReplacements &replacements);
+    bool readFile(const char *path, String &out);
+    void sendTemplateError(const char *path);
+    void ensureMenuHtmlLoaded();
+    void applyMenuHtmlForLocale(const String &locale);
+    bool remountLittleFsIfNeeded(const char *context);
+    void dumpFilesystemContents(const __FlashStringHelper *reason);
+    bool sendStaticFile(const char *path, const char *contentType);
+    void applyTemplateReplacements(String &content, const TemplateReplacements &replacements);
+    void appendCommonTemplateVars(TemplateReplacements &replacements);
+    bool requirePortalPost(const char *route,
+                           std::initializer_list<const char *> requiredFields = {},
+                           bool jsonResponse = false);
+    void rejectPortalPost(const char *route, int code, const String &message, bool jsonResponse);
+    String currentClientIp() const;
+    String generateCsrfToken() const;
+    void ensureCsrfToken();
+    String csrfHiddenInput() const;
+    void logConfigSave(const char *route, const std::vector<String> &changedFields);
+    std::vector<String> collectChangedConfigFields(const AppConfig &before, const AppConfig &after) const;
+    void handleLogsJson();
+    void disablePortalPowerSave();
+    void restorePortalPowerSave();
+    void logPortalState(const char *context);
+    bool hasStoredCredentials() const;
+    void scheduleRestart(const char *reason);
+    String resolvePortalLocale() const;
+    void handleOtaStatus();
+    void handleOtaFetch();
+    void handleOtaUploadBegin();
+    void handleOtaUploadPartBegin();
+    void handleOtaUploadPartChunk();
+    void handleOtaUploadPartFinish();
+    void handleOtaUploadFinish();
+    void handleOtaCancel();
+    struct ManifestPart
+    {
+        String path;
+        uint32_t offset = 0;
+    };
+    bool parseManifestParts(const String &manifestJson, std::vector<ManifestPart> &parts, String &version, String &error);
+    bool fetchRemoteManifest(String &manifestJson, String &version, String &error);
+    bool downloadRemotePart(const String &baseUrl, const String &path, uint32_t offset, String &error);
+    void resetOtaProgress();
+    void setOtaProgress(const String &message, size_t totalBytes, size_t writtenBytes);
+    void updateOtaBytes(size_t writtenBytes);
+    void setOtaMessage(const String &message);
+    bool decodeBase64Chunk(const String &input, std::vector<uint8_t> &out, String &error);
+    void notifyOtaStart();
+    void refreshLatestRemoteVersion(bool force);
+    static void otaTaskThunk(void *param);
+    void runRemoteFetchTask();
+    static void manifestTaskThunk(void *param);
+    void runManifestFetchTask(bool force);
+    void sendJson(int code, const String &body);
+
+    AppConfig &config_;
+    AppConfigStore &store_;
+    DeviceInfoStore &deviceInfo_;
+    DeviceInfoPage deviceInfoPage_;
+    BridgeInfoPage bridgeInfoPage_;
+    WiFiManager manager_;
+    WebServer ethernetServer_;
+    bool wifiManagerInitialized_ = false;
+    bool ethernetStarted_ = false;
+    bool ethernetPortalActive_ = false;
+    bool ethernetServerStarted_ = false;
+    bool ethernetRoutesRegistered_ = false;
+    DebugLogStream &log_;
+    LedController &led_;
+    const PublisherHealth &openRadiationHealth_;
+    SafecastPublisher *safecastPublisher_ = nullptr;
+    RadProUpdateService *radProUpdater_ = nullptr;
+
+    bool paramsAttached_;
+    String csrfToken_;
+    String menuHtml_;
+    String menuHtmlRendered_;
+    String menuHtmlLocale_;
+    wl_status_t lastStatus_;
+    WiFiEventId_t wifiEventId_;
+    IPAddress lastIp_;
+    bool hasLoggedIp_;
+    bool loggingEnabled_ = false;
+    bool pendingReconnect_ = false;
+    unsigned long lastReconnectAttemptMs_ = 0;
+    unsigned long waitingForIpSinceMs_ = 0;
+    IPAddress monitoredGateway_;
+    WiFiReconnectPolicy::GatewayHealthState gatewayHealth_;
+    unsigned long lastGatewayProbeMs_ = 0;
+    uint32_t gatewayLeaseGeneration_ = 0;
+    uint32_t gatewayProbeGeneration_ = 0;
+    uint32_t gatewayProbeResultGeneration_ = 0;
+    bool gatewayProbeInFlight_ = false;
+    bool gatewayProbeFinished_ = false;
+    bool gatewayProbeSucceeded_ = false;
+    portMUX_TYPE gatewayProbeLock_ = portMUX_INITIALIZER_UNLOCKED;
+    bool onboardingMode_ = false;
+    String lastKnownSsid_;
+    String lastKnownPass_;
+    bool portalPsDisabled_ = false;
+    wifi_ps_type_t previousPsType_ = WIFI_PS_MIN_MODEM;
+    bool routesRegistered_ = false;
+    bool restartScheduled_ = false;
+    unsigned long restartAtMs_ = 0;
+    OtaUpdateService otaService_;
+    bool otaUploadOk_ = true;
+    String otaProgressMessage_;
+    size_t otaBytesExpected_ = 0;
+    size_t otaBytesWritten_ = 0;
+    unsigned long otaLastProgressMs_ = 0;
+    String latestRemoteVersion_;
+    String latestRemoteError_;
+    unsigned long latestRemoteCheckMs_ = 0;
+    std::vector<uint8_t> otaChunkBuffer_;
+    TaskHandle_t otaTaskHandle_ = nullptr;
+    portMUX_TYPE otaLock_ = portMUX_INITIALIZER_UNLOCKED;
+    TaskHandle_t manifestTaskHandle_ = nullptr;
+    bool manifestForceRefresh_ = false;
+    std::function<void()> onOtaStart_;
+    bool otaHooksFired_ = false;
+};

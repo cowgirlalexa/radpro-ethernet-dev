@@ -1,0 +1,3144 @@
+// SPDX-FileCopyrightText: 2026 André Fiedler
+//
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#include "ConfigPortal/WiFiPortalService.h"
+#include "RadProUpdate/RadProUpdateService.h"
+
+#include "ConfigPortal/PortalSecurity.h"
+#include "ConfigPortal/WiFiReconnectPolicy.h"
+#include "FileSystem/BridgeFileSystem.h"
+#include "Ota/OtaUpdateService.h"
+#include "Mqtt/MqttPublisher.h"
+#include "OpenSenseMap/OpenSenseMapPublisher.h"
+#include "GmcMap/GmcMapPublisher.h"
+#include "OpenRadiation/OpenRadiationBackupJson.h"
+#include "OpenRadiation/OpenRadiationMeasurementMetadata.h"
+#include "OpenRadiation/OpenRadiationPayload.h"
+#include "OpenRadiation/OpenRadiationPortalLinks.h"
+#include "OpenRadiation/OpenRadiationPortalView.h"
+#include "OpenRadiation/OpenRadiationProtocol.h"
+#include "Radmon/RadmonPublisher.h"
+#include "Safecast/SafecastBackupJson.h"
+#include "Safecast/SafecastConfig.h"
+#include "Safecast/SafecastLogRedaction.h"
+#include "Safecast/SafecastPayload.h"
+#include "Safecast/SafecastProtocol.h"
+#include "Safecast/SafecastPublisher.h"
+#include "Logging/LogCursorWindow.h"
+#include "Logging/BridgePanicRecorder.h"
+#include "Publishing/HttpPublishResponse.h"
+#include "NetworkStatus.h"
+
+#include <Arduino.h>
+#include <WiFiClientSecure.h>
+#include <WebServer.h>
+#include <SPI.h>
+#include <ETH.h>
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <time.h>
+#include <vector>
+#include <esp_system.h>
+#include <esp_ota_ops.h>
+#include <esp_wifi.h>
+#include <ArduinoJson.h>
+#include "AppConfig/UsbRecoverySettings.h"
+
+namespace
+{
+constexpr int kEthSclkPin = 13;
+constexpr int kEthMisoPin = 12;
+constexpr int kEthMosiPin = 11;
+constexpr int kEthCsPin = 14;
+constexpr int kEthResetPin = 9;
+constexpr int kEthInterruptPin = 10;
+constexpr int kEthPhyAddress = 1;
+constexpr unsigned long kEthernetNoLinkGraceMs = 3000;
+constexpr unsigned long kEthernetDhcpWaitMs = 12000;
+
+constexpr const char kPortalHeadElement[] =
+    "<link rel=\"icon\" href=\"/favicon.ico\" sizes=\"16x16 32x32 48x48\">"
+    "<link rel=\"icon\" href=\"/portal/icon.svg\" type=\"image/svg+xml\" sizes=\"any\">"
+    "<link rel=\"apple-touch-icon\" href=\"/portal/apple-touch-icon.png\">"
+    "<link rel=\"mask-icon\" href=\"/portal/safari-pinned-tab.svg\" color=\"#b87813\">"
+    "<style>"
+    ".wrap > h1::before{content:'';display:block;width:56px;height:56px;"
+    "margin-bottom:12px;background:url('/portal/icon.svg') center/contain no-repeat;}"
+    "html.portal-subtitle-pending body .wrap > h3{visibility:hidden;}"
+    "html.portal-subtitle-ready body .wrap > h3{visibility:visible;}"
+    "</style>"
+    "<script src=\"/portal/portal-head-bootstrap.js\"></script>";
+
+String readHttpsBody(WiFiClientSecure &client, unsigned long timeoutMs, size_t maxBytes)
+{
+    String body;
+    const unsigned long startedAt = millis();
+    while ((millis() - startedAt) < timeoutMs)
+    {
+        while (client.available() > 0)
+        {
+            const int ch = client.read();
+            if (ch < 0)
+                break;
+            if (body.length() < maxBytes)
+            {
+                const char text[2] = {static_cast<char>(ch), '\0'};
+                body += text;
+            }
+        }
+
+        if (!client.connected() && client.available() <= 0)
+            break;
+
+        delay(10);
+        yield();
+    }
+
+    body.trim();
+    return body;
+}
+
+bool formatUtcTimestamp(time_t epoch, String &out)
+{
+    if (epoch <= 0)
+        return false;
+
+    struct tm tmUtc;
+    if (!gmtime_r(&epoch, &tmUtc))
+        return false;
+
+    char buffer[32];
+    size_t written = strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%SZ", &tmUtc);
+    if (written == 0)
+        return false;
+
+    out = buffer;
+    return true;
+}
+
+String resolveDryRunTimestamp(time_t epoch, const char *fallback)
+{
+    String timestamp;
+    if (formatUtcTimestamp(epoch, timestamp))
+        return timestamp;
+    return String(fallback ? fallback : "");
+}
+
+void resolveDryRunPulseWindow(const DeviceInfoSnapshot &info, String &startPulseCount, String &endPulseCount)
+{
+    uint32_t livePulseCount = 0;
+    if (OpenRadiationMeasurementMetadata::tryParsePulseCount(info.tubePulseCount, livePulseCount))
+    {
+        endPulseCount = String(livePulseCount);
+        startPulseCount = String(livePulseCount >= 42 ? (livePulseCount - 42) : 0);
+        return;
+    }
+
+    startPulseCount = "100";
+    endPulseCount = "142";
+}
+
+bool buildOpenRadiationDryRunPayload(const AppConfig &config,
+                                     const DeviceInfoSnapshot &info,
+                                     String &outJson,
+                                     String &outError)
+{
+    const String apparatusId = OpenRadiationProtocol::resolveApparatusId(config.openRadiationDeviceId, info.deviceId).length()
+                                   ? OpenRadiationProtocol::resolveApparatusId(config.openRadiationDeviceId, info.deviceId)
+                                   : String("dry-run-preview");
+
+    float doseRate = info.tubeDoseRate.toFloat();
+    if (!(doseRate > 0.0f))
+        doseRate = 0.1234f;
+
+    const time_t now = time(nullptr);
+    const String startTime = resolveDryRunTimestamp(now > 300 ? (now - 300) : now, "2026-04-21T12:00:00Z");
+    const String endTime = resolveDryRunTimestamp(now, "2026-04-21T12:05:00Z");
+
+    String startPulseCount;
+    String endPulseCount;
+    resolveDryRunPulseWindow(info, startPulseCount, endPulseCount);
+
+    JsonDocument doc;
+    const OpenRadiationPayload::BuildError error = OpenRadiationPayload::buildPayloadDocument(
+        doc,
+        config,
+        apparatusId,
+        info.firmware.length() ? info.firmware : String(BRIDGE_FIRMWARE_VERSION),
+        OpenRadiationProtocol::buildOrganisationReporting(BRIDGE_FIRMWARE_VERSION),
+        "11111111-1111-4111-8111-111111111111",
+        doseRate,
+        startTime,
+        endTime,
+        startPulseCount,
+        endPulseCount);
+    if (error != OpenRadiationPayload::BuildError::None)
+    {
+        outError = OpenRadiationPayload::buildErrorText(error);
+        return false;
+    }
+
+    OpenRadiationPayload::redactSecrets(doc);
+    outJson.clear();
+    serializeJsonPretty(doc, outJson);
+    return true;
+}
+
+bool parseUnsignedText(const String &text, uint32_t &out)
+{
+    String trimmed = text;
+    trimmed.trim();
+    if (!trimmed.length())
+        return false;
+
+    char *end = nullptr;
+    const unsigned long parsed = std::strtoul(trimmed.c_str(), &end, 10);
+    if (!end || end == trimmed.c_str() || *end != '\0')
+        return false;
+    out = static_cast<uint32_t>(parsed);
+    return true;
+}
+
+String escapeHtml(const String &value)
+{
+    String out;
+    for (size_t i = 0; i < value.length(); ++i)
+    {
+        const char c = value[i];
+        switch (c)
+        {
+        case '&':
+            out += "&amp;";
+            break;
+        case '<':
+            out += "&lt;";
+            break;
+        case '>':
+            out += "&gt;";
+            break;
+        case '"':
+            out += "&quot;";
+            break;
+        case '\'':
+            out += "&#39;";
+            break;
+        default:
+            out += c;
+            break;
+        }
+    }
+    return out;
+}
+
+String formatSafecastResultHtml(const SafecastPublisher::UploadResult &result)
+{
+    String html;
+    html += "<div class='result-block";
+    html += result.success ? " success" : " error";
+    html += "'>";
+    html += "<strong>";
+    html += result.success ? "Safecast Test-Upload erfolgreich." : "Safecast Test-Upload fehlgeschlagen.";
+    html += "</strong><pre>";
+
+    if (result.statusLine.length())
+        html += escapeHtml(result.statusLine);
+    else if (result.statusCode > 0)
+    {
+        String statusText = "HTTP ";
+        statusText += String(result.statusCode);
+        html += escapeHtml(statusText);
+    }
+    else if (result.errorMessage.length())
+        html += escapeHtml(result.errorMessage);
+    else
+        html += "No response";
+
+    if (result.responseBody.length())
+    {
+        html += "\n\n";
+        html += escapeHtml(result.responseBody);
+    }
+    html += "</pre></div>";
+    return html;
+}
+} // namespace
+
+WiFiPortalService::WiFiPortalService(AppConfig &config,
+                                     AppConfigStore &store,
+                                     DeviceInfoStore &info,
+                                     DebugLogStream &logPort,
+                                     LedController &led,
+                                     const PublisherHealth &openSenseMapHealth,
+                                     const PublisherHealth &gmcMapHealth,
+                                     const PublisherHealth &radmonHealth,
+                                     const PublisherHealth &openRadiationHealth,
+                                     const PublisherHealth &safecastHealth)
+    : config_(config),
+      store_(store),
+      deviceInfo_(info),
+      deviceInfoPage_(info),
+      bridgeInfoPage_(openSenseMapHealth, gmcMapHealth, radmonHealth, openRadiationHealth, safecastHealth),
+      manager_(),
+      ethernetServer_(80),
+      log_(logPort),
+      led_(led),
+      openRadiationHealth_(openRadiationHealth),
+      paramsAttached_(false),
+      lastStatus_(WL_NO_SHIELD),
+      wifiEventId_(0),
+      lastIp_(),
+      hasLoggedIp_(false),
+      loggingEnabled_(false),
+      pendingReconnect_(false),
+      lastReconnectAttemptMs_(0),
+      waitingForIpSinceMs_(0),
+      portalPsDisabled_(false),
+      previousPsType_(WIFI_PS_MIN_MODEM)
+{
+}
+
+
+WebServer *WiFiPortalService::activeServer()
+{
+    if (ethernetPortalActive_)
+        return &ethernetServer_;
+    return manager_.server.get();
+}
+
+WebServer *WiFiPortalService::activeServer() const
+{
+    if (ethernetPortalActive_)
+        return const_cast<WebServer *>(&ethernetServer_);
+    return const_cast<WebServer *>(manager_.server.get());
+}
+
+bool WiFiPortalService::networkConnected() const
+{
+    return NetworkStatus::connected();
+}
+
+bool WiFiPortalService::usingEthernet() const
+{
+    return ethernetPortalActive_ && NetworkStatus::ethernetConnected();
+}
+
+IPAddress WiFiPortalService::networkIP() const
+{
+    if (usingEthernet())
+        return ETH.localIP();
+    return WiFi.localIP();
+}
+
+void WiFiPortalService::initializeWiFiManager()
+{
+    if (wifiManagerInitialized_)
+        return;
+
+    log_.println(F("Initializing Wi-Fi fallback."));
+    manager_.setDebugOutput(true);
+    manager_.setWiFiAutoReconnect(false);
+    WiFi.setAutoReconnect(false);
+    manager_.setClass("invert");
+    manager_.setConnectTimeout(10);
+    manager_.setConnectRetries(1);
+    manager_.setTitle("RadPro WiFi Bridge Configuration");
+    manager_.setCustomHeadElement(kPortalHeadElement);
+    manager_.setAPStaticIPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
+    manager_.setWiFiAPChannel(1);
+    std::vector<const char *> menuEntries = {"wifi", "custom"};
+    manager_.setMenu(menuEntries);
+    log_.print(F("WiFi portal menu tokens: "));
+    for (size_t i = 0; i < menuEntries.size(); ++i)
+    {
+        log_.print(menuEntries[i]);
+        if (i + 1 < menuEntries.size())
+            log_.print(F(", "));
+    }
+    log_.println();
+
+    wifiEventId_ = WiFi.onEvent([this](WiFiEvent_t event, WiFiEventInfo_t info)
+                                { handleWiFiEvent(event, info); });
+
+    attachParameters();
+    refreshParameters();
+    wifiManagerInitialized_ = true;
+}
+
+void WiFiPortalService::initializeEthernet()
+{
+    if (ethernetStarted_)
+        return;
+
+    log_.println(F("Initializing Waveshare ESP32-S3-ETH W5500 Ethernet."));
+    SPI.begin(kEthSclkPin, kEthMisoPin, kEthMosiPin, kEthCsPin);
+
+    // Waveshare ESP32-S3-ETH:
+    //   SCLK=13, MISO=12, MOSI=11, CS=14, RESET=9, INT=10.
+    if (!ETH.begin(ETH_PHY_W5500, kEthPhyAddress, kEthCsPin, kEthInterruptPin, kEthResetPin, SPI))
+    {
+        log_.println(F("W5500 Ethernet initialization failed."));
+        return;
+    }
+
+    ethernetStarted_ = true;
+    const char *hostname = config_.deviceName.length() ? config_.deviceName.c_str() : "radpro-wifi-bridge";
+    if (!ETH.setHostname(hostname))
+        log_.println(F("Warning: unable to set Ethernet hostname."));
+    log_.println(F("W5500 Ethernet initialized; waiting for link/DHCP."));
+}
+
+bool WiFiPortalService::waitForPreferredEthernet()
+{
+    if (!ethernetStarted_)
+        return false;
+
+    const unsigned long startedAt = millis();
+    bool linkSeen = NetworkStatus::ethernetLinkUp();
+
+    while (!NetworkStatus::ethernetConnected())
+    {
+        const unsigned long elapsed = millis() - startedAt;
+        if (NetworkStatus::ethernetLinkUp())
+            linkSeen = true;
+
+        // With no physical link, fall back quickly.  Once link is detected,
+        // allow DHCP more time before deciding that wired networking is not usable.
+        if ((!linkSeen && elapsed >= kEthernetNoLinkGraceMs) ||
+            (linkSeen && elapsed >= kEthernetDhcpWaitMs))
+            break;
+
+        delay(50);
+        yield();
+    }
+
+    if (!NetworkStatus::ethernetConnected())
+    {
+        if (linkSeen)
+            log_.println(F("Ethernet link detected but no DHCP lease received; enabling Wi-Fi fallback."));
+        else
+            log_.println(F("No Ethernet link detected; enabling Wi-Fi fallback."));
+        return false;
+    }
+
+    return true;
+}
+
+void WiFiPortalService::startEthernetPortal()
+{
+    if (!NetworkStatus::ethernetConnected())
+        return;
+
+    if (!ethernetPortalActive_)
+    {
+        log_.print(F("Ethernet has IP "));
+        log_.print(ETH.localIP());
+        log_.println(F("; disabling Wi-Fi and starting Ethernet web portal."));
+
+        // Force all new outbound sockets onto the wired interface before the
+        // Wi-Fi radio is shut down.
+        ETH.setDefault();
+
+        if (wifiManagerInitialized_)
+        {
+            if (manager_.getConfigPortalActive())
+                manager_.stopConfigPortal();
+            if (manager_.getWebPortalActive())
+                manager_.stopWebPortal();
+
+            // Wi-Fi had previously been used as a fallback. Shut the radio
+            // completely down now that Ethernet owns the network.
+            WiFi.disconnect(true, false);
+            WiFi.mode(WIFI_OFF);
+        }
+
+        pendingReconnect_ = false;
+        waitingForIpSinceMs_ = 0;
+
+        led_.clearFault(FaultCode::WifiPortalStuck);
+        led_.clearFault(FaultCode::WifiDhcpFailure);
+        led_.clearFault(FaultCode::PortalReconnectFailed);
+        led_.clearFault(FaultCode::WifiAuthFailure);
+
+        ethernetPortalActive_ = true;
+    }
+
+    if (!ethernetRoutesRegistered_)
+    {
+        registerPortalRoutes();
+    }
+
+    if (!ethernetServerStarted_)
+    {
+        ethernetServer_.begin();
+        ethernetServerStarted_ = true;
+        log_.println(F("Ethernet web server listening on port 80."));
+    }
+}
+
+void WiFiPortalService::stopEthernetPortal()
+{
+    if (!ethernetPortalActive_)
+        return;
+
+    log_.println(F("Ethernet IP lost; stopping Ethernet web portal."));
+    ethernetServer_.stop();
+    ethernetServerStarted_ = false;
+    ethernetPortalActive_ = false;
+}
+
+void WiFiPortalService::maintainEthernet()
+{
+    if (!ethernetStarted_)
+        return;
+
+    const bool hasIp = NetworkStatus::ethernetConnected();
+
+    if (hasIp)
+    {
+        startEthernetPortal();
+    }
+    else if (ethernetPortalActive_)
+    {
+        stopEthernetPortal();
+    }
+}
+
+void WiFiPortalService::sendEthernetMainMenu()
+{
+    if (!activeServer())
+        return;
+
+    ensureMenuHtmlLoaded();
+    applyMenuHtmlForLocale(resolvePortalLocale());
+
+    TemplateReplacements vars;
+    appendCommonTemplateVars(vars);
+    String menu = menuHtmlRendered_;
+    applyTemplateReplacements(menu, vars);
+
+    String html;
+    html.reserve(menu.length() + 1200);
+    html += F("<!DOCTYPE html><html lang=\"");
+    html += resolvePortalLocale();
+    html += F("\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">");
+    html += F("<title>RadPro WiFi Bridge</title><link rel=\"stylesheet\" href=\"/portal/portal.css\">");
+    html += kPortalHeadElement;
+    html += F("</head><body class=\"invert\"><div class=\"wrap\"><h1>RadPro WiFi Bridge</h1>");
+    html += menu;
+    html += F("</div></body></html>");
+
+    activeServer()->send(200, "text/html", html);
+}
+
+void WiFiPortalService::begin()
+{
+    ensureCsrfToken();
+
+    // Ethernet is deliberately evaluated before WiFiManager or any Wi-Fi API
+    // is initialized. This guarantees that a successful wired boot never starts
+    // STA mode, an AP, a scan, or a Wi-Fi connection attempt.
+    initializeEthernet();
+    waitForPreferredEthernet();
+    maintainEthernet();
+
+    if (!ethernetPortalActive_)
+        initializeWiFiManager();
+
+    logStatusIfNeeded();
+    dumpFilesystemContents(F("WiFiPortalService begin"));
+    logPortalState("begin");
+}
+
+void WiFiPortalService::setOtaStartCallback(std::function<void()> cb)
+{
+    onOtaStart_ = std::move(cb);
+}
+
+void WiFiPortalService::setSafecastPublisher(SafecastPublisher &publisher)
+{
+    safecastPublisher_ = &publisher;
+}
+
+void WiFiPortalService::notifyOtaStart()
+{
+    if (otaHooksFired_)
+        return;
+    otaHooksFired_ = true;
+    if (onOtaStart_)
+        onOtaStart_();
+}
+
+bool WiFiPortalService::connect(bool forcePortal)
+{
+    log_.print(F("WiFiPortalService::connect(forcePortal="));
+    log_.print(forcePortal ? F("true") : F("false"));
+    log_.println(F(") invoked."));
+    logPortalState("connect(start)");
+
+    maintainEthernet();
+    if (ethernetPortalActive_)
+    {
+        log_.println(F("Ethernet is active; skipping Wi-Fi startup."));
+        return true;
+    }
+
+    initializeWiFiManager();
+    refreshParameters();
+
+    bool haveStoredCredentials = hasStoredCredentials();
+    bool connected = false;
+    if (!forcePortal && !haveStoredCredentials)
+    {
+        forcePortal = true;
+        log_.println(F("No saved Wi-Fi credentials detected; forcing configuration portal."));
+    }
+
+    onboardingMode_ = forcePortal && !haveStoredCredentials;
+
+    const bool recoveryPortal = forcePortal && haveStoredCredentials;
+
+    if (forcePortal)
+    {
+        String apName = config_.deviceName.length() ? config_.deviceName : String("RadPro WiFi Bridge");
+        apName += " Setup";
+        log_.print(F("Starting Wi-Fi configuration portal with SSID '"));
+        log_.print(apName);
+        log_.println(F("'"));
+        if (onboardingMode_)
+        {
+            log_.println(F("Onboarding: switching to AP-only mode to keep the captive portal stable."));
+            prepareConfigPortalAp(apName);
+        }
+        manager_.setConfigPortalTimeout(0);
+        // Keep the portal non-blocking on Ethernet-capable hardware so a late
+        // DHCP lease can still be detected and immediately pre-empt Wi-Fi.
+        const bool backgroundPortal = recoveryPortal || ethernetStarted_;
+        manager_.setConfigPortalBlocking(!backgroundPortal);
+        connected = manager_.startConfigPortal(apName.c_str());
+        if (manager_.getConfigPortalActive())
+        {
+            if (recoveryPortal)
+            {
+                pendingReconnect_ = true;
+                lastReconnectAttemptMs_ = 0;
+                waitingForIpSinceMs_ = 0;
+                log_.println(F("Configuration portal running in background; stored Wi-Fi credentials will be retried."));
+            }
+            else
+            {
+                log_.println(F("Configuration portal running in background for first-time setup."));
+            }
+        }
+        else
+        {
+            log_.println(connected ? F("Configuration portal completed (credentials supplied).") : F("Configuration portal exited without connection."));
+        }
+        logPortalState("after startConfigPortal");
+    }
+    else
+    {
+        manager_.setConfigPortalTimeout(30);
+        manager_.setConfigPortalBlocking(true);
+        log_.println(F("Attempting Wi-Fi autoConnect()…"));
+        connected = manager_.autoConnect(config_.deviceName.c_str());
+        log_.println(connected ? F("autoConnect() succeeded.") : F("autoConnect() failed or timed out."));
+        if (!connected)
+            logPortalState("autoConnect failed");
+    }
+
+    const bool portalRunning = manager_.getConfigPortalActive();
+    if (!connected && !portalRunning)
+    {
+        led_.activateFault(FaultCode::WifiPortalStuck);
+        log_.println(F("WiFiPortalService::connect() returning failure."));
+        return false;
+    }
+
+    logStatusIfNeeded();
+    if (WiFi.status() == WL_CONNECTED)
+    {
+        onboardingMode_ = false;
+        IPAddress ip = WiFi.localIP();
+        if (ip != IPAddress(0, 0, 0, 0))
+        {
+            IPAddress gw = WiFi.gatewayIP();
+            IPAddress mask = WiFi.subnetMask();
+            logConnectionDetails(ip, gw, mask);
+            lastIp_ = ip;
+            hasLoggedIp_ = true;
+            led_.clearFault(FaultCode::WifiPortalStuck);
+            led_.clearFault(FaultCode::WifiDhcpFailure);
+            led_.clearFault(FaultCode::PortalReconnectFailed);
+            led_.clearFault(FaultCode::WifiAuthFailure);
+        }
+    }
+    return true;
+}
+
+void WiFiPortalService::maintain()
+{
+    const bool wasUsingEthernet = ethernetPortalActive_;
+    maintainEthernet();
+
+    if (ethernetPortalActive_)
+    {
+        // Ethernet is the primary network. Do not start, scan, reconnect, or
+        // expose a Wi-Fi AP while the wired interface has an IP address.
+        ethernetServer_.handleClient();
+
+        if (restartScheduled_ && millis() >= restartAtMs_)
+        {
+            log_.println(F("Restarting device to apply configuration changes."));
+            delay(100);
+            ESP.restart();
+        }
+        return;
+    }
+
+    if (wasUsingEthernet && !NetworkStatus::ethernetConnected())
+    {
+        log_.println(F("Ethernet disconnected; falling back to Wi-Fi."));
+        initializeWiFiManager();
+        WiFi.mode(WIFI_STA);
+        WiFi.setHostname(config_.deviceName.c_str());
+        connect(false);
+        return;
+    }
+
+    const bool connected = WiFi.status() == WL_CONNECTED;
+    const unsigned long now = millis();
+    bool configPortalActive = manager_.getConfigPortalActive();
+    bool webPortalActive = manager_.getWebPortalActive();
+    bool haveStoredCredentials = hasStoredCredentials();
+    if (onboardingMode_ && haveStoredCredentials)
+    {
+        onboardingMode_ = false;
+        if (!configPortalActive && !connected)
+        {
+            pendingReconnect_ = true;
+            lastReconnectAttemptMs_ = 0;
+        }
+    }
+    const bool onboarding = onboardingMode_ || !haveStoredCredentials;
+
+    if (connected && configPortalActive && !onboarding)
+    {
+        log_.println(F("Wi-Fi reconnected; stopping configuration portal."));
+        manager_.stopConfigPortal();
+        configPortalActive = manager_.getConfigPortalActive();
+        webPortalActive = manager_.getWebPortalActive();
+        logPortalState("stopConfigPortalAfterReconnect");
+    }
+
+    if (connected)
+    {
+        if (!configPortalActive && !webPortalActive)
+        {
+            refreshParameters();
+            if (!menuHtml_.length())
+            {
+                log_.println(F("Menu HTML empty prior to portal start; attempting reload."));
+                ensureMenuHtmlLoaded();
+            }
+            log_.print(F("Starting Wi-Fi web portal; menu bytes="));
+            log_.print(menuHtml_.length());
+            log_.print(F(" routes registered="));
+            log_.println(routesRegistered_ ? F("true") : F("false"));
+            manager_.startWebPortal();
+            log_.println(manager_.getWebPortalActive() ? F("Wi-Fi web portal started.") : F("Wi-Fi web portal inactive after start request."));
+            logPortalState("startWebPortal");
+        }
+    }
+    else
+    {
+        // Stay in AP/config portal when not connected or when onboarding (no creds).
+        if (webPortalActive && (configPortalActive || onboarding))
+        {
+            // Keep the portal running for setup; do not stop.
+            logPortalState("webPortalActive-keep");
+        }
+        else if (webPortalActive)
+        {
+            log_.println(F("Stopping Wi-Fi web portal (station disconnected)."));
+            manager_.stopWebPortal();
+            logPortalState("stopWebPortal");
+        }
+        else if (!webPortalActive && onboarding && !configPortalActive)
+        {
+            // Edge case: lost credentials or first boot – ensure portal is available.
+            ensureMenuHtmlLoaded();
+            log_.println(F("Starting Wi-Fi web portal for onboarding (no credentials detected)."));
+            manager_.startWebPortal();
+            logPortalState("startWebPortalOnboarding");
+        }
+    }
+
+    logStatusIfNeeded();
+
+    if (waitingForIpSinceMs_ > 0 &&
+        !WiFiReconnectPolicy::isConnectionAttemptInFlight(now, waitingForIpSinceMs_))
+    {
+        waitingForIpSinceMs_ = 0;
+        led_.activateFault(FaultCode::WifiDhcpFailure);
+        log_.println(F("Wi-Fi connection attempt timed out while waiting for an IP address."));
+    }
+
+    if (pendingReconnect_)
+    {
+        if (WiFiReconnectPolicy::shouldSuppressRetry(configPortalActive, onboarding, haveStoredCredentials))
+        {
+            pendingReconnect_ = false;
+            lastReconnectAttemptMs_ = 0;
+            waitingForIpSinceMs_ = 0;
+            log_.println(F("Reconnect suppressed while captive portal is active/onboarding."));
+        }
+        else
+        {
+            wl_status_t status = WiFi.status();
+            if (WiFiReconnectPolicy::isConnectionAttemptInFlight(now, waitingForIpSinceMs_))
+            {
+                // Association/reconnect is in progress. Give DHCP time to emit GOT_IP.
+            }
+            else if (status == WL_CONNECTED)
+            {
+                pendingReconnect_ = false;
+                lastReconnectAttemptMs_ = 0;
+                waitingForIpSinceMs_ = 0;
+                hasLoggedIp_ = false;
+                logStatusIfNeeded();
+                log_.println("Wi-Fi reconnect complete.");
+                led_.clearFault(FaultCode::PortalReconnectFailed);
+            }
+            else
+            {
+                if (WiFiReconnectPolicy::isRetryDue(now, lastReconnectAttemptMs_))
+                {
+                    attemptReconnect();
+                    if (WiFi.status() != WL_CONNECTED)
+                        led_.activateFault(FaultCode::PortalReconnectFailed);
+                }
+            }
+        }
+    }
+
+    maintainGatewayMonitor(connected);
+
+    if (restartScheduled_)
+    {
+        if (millis() >= restartAtMs_)
+        {
+            log_.println(F("Restarting device to apply configuration changes."));
+            delay(100);
+            ESP.restart();
+        }
+    }
+}
+
+void WiFiPortalService::process()
+{
+    if (ethernetPortalActive_)
+    {
+        // Ethernet server is serviced from maintain(); nothing else is needed here.
+        return;
+    }
+
+    if (wifiManagerInitialized_ && (manager_.getWebPortalActive() || manager_.getConfigPortalActive()))
+    {
+        manager_.process();
+    }
+}
+
+void WiFiPortalService::syncIfRequested()
+{
+    if (store_.consumeSaveRequest())
+    {
+        log_.println(F("Ignoring deprecated WiFiManager parameter save request; app settings use dedicated portal routes."));
+    }
+}
+
+void WiFiPortalService::dumpStatus()
+{
+    logStatus();
+    logPortalState("dumpStatus");
+}
+
+void WiFiPortalService::enableStatusLogging()
+{
+    if (loggingEnabled_)
+        return;
+
+    loggingEnabled_ = true;
+    hasLoggedIp_ = false;
+    logStatus();
+}
+
+void WiFiPortalService::refreshParameters()
+{
+    manager_.setHostname(config_.deviceName.c_str());
+    attachParameters();
+}
+
+void WiFiPortalService::attachParameters()
+{
+    if (paramsAttached_)
+    {
+        log_.println(F("attachParameters(): parameters already attached; skipping."));
+        return;
+    }
+
+    log_.println(F("attachParameters(): registering custom portal routes."));
+
+    ensureMenuHtmlLoaded();
+    if (menuHtml_.length())
+    {
+        log_.print(F("Applying custom menu HTML ("));
+        log_.print(menuHtml_.length());
+        log_.println(F(" bytes)."));
+        applyMenuHtmlForLocale(resolvePortalLocale());
+    }
+    else
+    {
+        log_.println(F("Custom menu HTML missing; Wi-Fi portal menu will only show default entries."));
+    }
+
+    manager_.setWebServerCallback([this]() { registerPortalRoutes(); });
+
+    log_.println(F("Custom Wi-Fi portal routes registered."));
+    paramsAttached_ = true;
+}
+
+void WiFiPortalService::registerPortalRoutes()
+{
+
+        log_.println(F("Web server callback invoked; registering custom portal routes."));
+        if (!activeServer())
+        {
+            log_.println(F("activeServer() is null; cannot register custom routes."));
+            return;
+        }
+        if (ethernetPortalActive_)
+            ethernetRoutesRegistered_ = true;
+        else
+            routesRegistered_ = true;
+        registerRadProUpdateRoutes();
+        log_.println(F("Custom network portal routes: /mqtt /osem /radmon /openradiation /openradiation/dry-run /openradiation/latest /gmc /safecast /metrics /device /device.json /bridge /bridge.json /usb-recovery /backup /backup.json /backup/restore /logs /logs.json /ota /ota/status /ota/fetch /ota/upload/* /restart"));
+
+        if (ethernetPortalActive_)
+        {
+            activeServer()->on("/", HTTP_GET, [this]() {
+                log_.println(F("HTTP GET / (Ethernet main menu)"));
+                sendEthernetMainMenu();
+            });
+        }
+
+        activeServer()->on("/favicon.ico", HTTP_GET, [this]() {
+            if (!sendStaticFile("/portal/favicon.ico", "image/x-icon"))
+                sendTemplateError("/portal/favicon.ico");
+        });
+
+        activeServer()->on("/portal/icon.svg", HTTP_GET, [this]() {
+            if (!sendStaticFile("/portal/icon.svg", "image/svg+xml"))
+                sendTemplateError("/portal/icon.svg");
+        });
+
+        activeServer()->on("/portal/apple-touch-icon.png", HTTP_GET, [this]() {
+            if (!sendStaticFile("/portal/apple-touch-icon.png", "image/png"))
+                sendTemplateError("/portal/apple-touch-icon.png");
+        });
+
+        activeServer()->on("/portal/safari-pinned-tab.svg", HTTP_GET, [this]() {
+            if (!sendStaticFile("/portal/safari-pinned-tab.svg", "image/svg+xml"))
+                sendTemplateError("/portal/safari-pinned-tab.svg");
+        });
+
+        activeServer()->on("/mqtt", HTTP_GET, [this]() {
+            log_.println(F("HTTP GET /mqtt"));
+            MqttPublisher::SendPortalForm(*this);
+        });
+
+        activeServer()->on("/portal/portal.css", HTTP_GET, [this]() {
+            log_.println(F("HTTP GET /portal/portal.css"));
+            if (!sendStaticFile("/portal/portal.css", "text/css"))
+                sendTemplateError("/portal/portal.css");
+        });
+
+        activeServer()->on("/portal/portal-head-bootstrap.js", HTTP_GET, [this]() {
+            log_.println(F("HTTP GET /portal/portal-head-bootstrap.js"));
+            if (!sendStaticFile("/portal/portal-head-bootstrap.js", "application/javascript"))
+                sendTemplateError("/portal/portal-head-bootstrap.js");
+        });
+
+        activeServer()->on("/portal/js/device-info.js", HTTP_GET, [this]() {
+            log_.println(F("HTTP GET /portal/js/device-info.js"));
+            if (!sendStaticFile("/portal/js/device-info.js", "application/javascript"))
+                sendTemplateError("/portal/js/device-info.js");
+        });
+
+        activeServer()->on("/portal/js/bridge-info.js", HTTP_GET, [this]() {
+            log_.println(F("HTTP GET /portal/js/bridge-info.js"));
+            if (!sendStaticFile("/portal/js/bridge-info.js", "application/javascript"))
+                sendTemplateError("/portal/js/bridge-info.js");
+        });
+
+        activeServer()->on("/portal/js/backup-page.js", HTTP_GET, [this]() {
+            log_.println(F("HTTP GET /portal/js/backup-page.js"));
+            if (!sendStaticFile("/portal/js/backup-page.js", "application/javascript"))
+                sendTemplateError("/portal/js/backup-page.js");
+        });
+
+        activeServer()->on("/portal/js/log-console.js", HTTP_GET, [this]() {
+            log_.println(F("HTTP GET /portal/js/log-console.js"));
+            if (!sendStaticFile("/portal/js/log-console.js", "application/javascript"))
+                sendTemplateError("/portal/js/log-console.js");
+        });
+
+        activeServer()->on("/portal/portal-locale.js", HTTP_GET, [this]() {
+            log_.println(F("HTTP GET /portal/portal-locale.js"));
+            if (!sendStaticFile("/portal/portal-locale.js", "application/javascript"))
+                sendTemplateError("/portal/portal-locale.js");
+        });
+
+        activeServer()->on("/portal/locales/en.json", HTTP_GET, [this]() {
+            log_.println(F("HTTP GET /portal/locales/en.json"));
+            if (!sendStaticFile("/portal/locales/en.json", "application/json"))
+                sendTemplateError("/portal/locales/en.json");
+        });
+
+        activeServer()->on("/portal/locales/de.json", HTTP_GET, [this]() {
+            log_.println(F("HTTP GET /portal/locales/de.json"));
+            if (!sendStaticFile("/portal/locales/de.json", "application/json"))
+                sendTemplateError("/portal/locales/de.json");
+        });
+
+        activeServer()->on("/portal/js/ota-page.js", HTTP_GET, [this]() {
+            log_.println(F("HTTP GET /portal/js/ota-page.js"));
+            if (!sendStaticFile("/portal/js/ota-page.js", "application/javascript"))
+                sendTemplateError("/portal/js/ota-page.js");
+        });
+
+        activeServer()->on("/portal/js/jszip.min.js", HTTP_GET, [this]() {
+            log_.println(F("HTTP GET /portal/js/jszip.min.js"));
+            if (!sendStaticFile("/portal/js/jszip.min.js", "application/javascript"))
+                sendTemplateError("/portal/js/jszip.min.js");
+        });
+
+        activeServer()->on("/mqtt", HTTP_POST, [this]() {
+            log_.println(F("HTTP POST /mqtt"));
+            if (!activeServer())
+                return;
+            if (!requirePortalPost("/mqtt", {"mqttHost", "mqttPort", "mqttClient", "mqttUser", "mqttPass", "mqttTopic", "mqttFullTopic", "readInterval"}))
+                return;
+            String message;
+            bool needsReconnect = MqttPublisher::HandlePortalPost(*activeServer(), config_, store_, led_, log_, message);
+            if (needsReconnect)
+            {
+                pendingReconnect_ = true;
+                lastReconnectAttemptMs_ = 0;
+                hasLoggedIp_ = false;
+            }
+            MqttPublisher::SendPortalForm(*this, message);
+        });
+
+        activeServer()->on("/osem", HTTP_GET, [this]() {
+            log_.println(F("HTTP GET /osem"));
+            OpenSenseMapPublisher::SendPortalForm(*this);
+        });
+
+        activeServer()->on("/osem", HTTP_POST, [this]() {
+            log_.println(F("HTTP POST /osem"));
+            if (!activeServer())
+                return;
+            if (!requirePortalPost("/osem", {"osemBoxId", "osemApiKey", "osemRate", "osemDose"}))
+                return;
+            String message;
+            OpenSenseMapPublisher::HandlePortalPost(*activeServer(), config_, store_, led_, log_, message);
+            OpenSenseMapPublisher::SendPortalForm(*this, message);
+        });
+
+        activeServer()->on("/radmon", HTTP_GET, [this]() {
+            log_.println(F("HTTP GET /radmon"));
+            RadmonPublisher::SendPortalForm(*this);
+        });
+
+        activeServer()->on("/radmon", HTTP_POST, [this]() {
+            log_.println(F("HTTP POST /radmon"));
+            if (!activeServer())
+                return;
+            if (!requirePortalPost("/radmon", {"radmonUser", "radmonPass"}))
+                return;
+            String message;
+            RadmonPublisher::HandlePortalPost(*activeServer(), config_, store_, led_, log_, message);
+            RadmonPublisher::SendPortalForm(*this, message);
+        });
+
+        activeServer()->on("/openradiation", HTTP_GET, [this]() {
+            log_.println(F("HTTP GET /openradiation"));
+            sendOpenRadiationForm();
+        });
+
+        activeServer()->on("/openradiation", HTTP_POST, [this]() {
+            log_.println(F("HTTP POST /openradiation"));
+            if (!requirePortalPost("/openradiation", {"orDeviceId", "orApiKey", "orUserId", "orUserPwd", "orLatitude", "orLongitude", "orAltitude", "orAccuracy", "orMeasurementEnvironment", "orMeasurementHeight"}))
+                return;
+            handleOpenRadiationPost();
+        });
+
+        activeServer()->on("/openradiation/dry-run", HTTP_GET, [this]() {
+            log_.println(F("HTTP GET /openradiation/dry-run"));
+            handleOpenRadiationDryRun();
+        });
+
+        activeServer()->on("/openradiation/latest", HTTP_GET, [this]() {
+            log_.println(F("HTTP GET /openradiation/latest"));
+            handleOpenRadiationLatest();
+        });
+
+        activeServer()->on("/gmc", HTTP_GET, [this]() {
+            log_.println(F("HTTP GET /gmc"));
+            GmcMapPublisher::SendPortalForm(*this);
+        });
+
+        activeServer()->on("/gmc", HTTP_POST, [this]() {
+            log_.println(F("HTTP POST /gmc"));
+            if (!activeServer())
+                return;
+            if (!requirePortalPost("/gmc", {"gmcAccount", "gmcDevice"}))
+                return;
+            String message;
+            GmcMapPublisher::HandlePortalPost(*activeServer(), config_, store_, led_, log_, message);
+            GmcMapPublisher::SendPortalForm(*this, message);
+        });
+
+        activeServer()->on("/safecast", HTTP_GET, [this]() {
+            log_.println(F("HTTP GET /safecast"));
+            sendSafecastForm(config_);
+        });
+
+        activeServer()->on("/safecast", HTTP_POST, [this]() {
+            log_.println(F("HTTP POST /safecast"));
+            if (!requirePortalPost("/safecast", {"safecastAction", "safecastApiBaseUrl", "safecastCustomApiBaseUrl", "safecastApiKey", "safecastDeviceId", "safecastLatitude", "safecastLongitude", "safecastHeightCm", "safecastLocationName", "safecastUnit", "safecastUploadIntervalSeconds"}))
+                return;
+            handleSafecastPost();
+        });
+
+        activeServer()->on("/metrics", HTTP_GET, [this]() {
+            log_.println(F("HTTP GET /metrics"));
+            deviceInfoPage_.handlePrometheus(activeServer());
+        });
+
+        activeServer()->on("/device", HTTP_GET, [this]() {
+            log_.println(F("HTTP GET /device"));
+            TemplateReplacements vars;
+            appendCommonTemplateVars(vars);
+            sendTemplate("/portal/device-info.html", vars);
+        });
+
+        activeServer()->on("/device.json", HTTP_GET, [this]() {
+            log_.println(F("HTTP GET /device.json"));
+            deviceInfoPage_.handleJson(activeServer());
+        });
+
+        activeServer()->on("/bridge", HTTP_GET, [this]() {
+            log_.println(F("HTTP GET /bridge"));
+            TemplateReplacements vars;
+            appendCommonTemplateVars(vars);
+            sendTemplate("/portal/bridge-info.html", vars);
+        });
+
+        activeServer()->on("/bridge.json", HTTP_GET, [this]() {
+            log_.println(F("HTTP GET /bridge.json"));
+            bridgeInfoPage_.handleJson(activeServer());
+        });
+
+        activeServer()->on("/usb-recovery", HTTP_GET, [this]() {
+            sendUsbRecoveryForm();
+        });
+        activeServer()->on("/usb-recovery", HTTP_POST, [this]() {
+            if (!requirePortalPost("/usb-recovery", {"timeoutMinutes"}))
+                return;
+            handleUsbRecoveryPost();
+        });
+
+        activeServer()->on("/logs", HTTP_GET, [this]() {
+            log_.println(F("HTTP GET /logs"));
+            TemplateReplacements vars;
+            appendCommonTemplateVars(vars);
+            sendTemplate("/portal/logs.html", vars);
+        });
+
+        activeServer()->on("/diagnostics/safecast.json", HTTP_GET, [this]() {
+            if (!safecastPublisher_) { sendJson(503, "{\"error\":\"Safecast unavailable\"}"); return; }
+            const auto samples = safecastPublisher_->sampleSnapshot();
+            JsonDocument doc;
+            doc["collecting"] = samples.collecting;
+            doc["doseUnit"] = samples.doseUnit;
+            doc["samples"] = static_cast<uint32_t>(samples.count);
+            doc["capacity"] = static_cast<uint32_t>(SafecastSampleBuffer::kCapacity);
+            doc["capacityDrops"] = samples.capacityDrops;
+            doc["hasLatestCpm"] = samples.hasCpm;
+            doc["hasLatestDose"] = samples.hasDose;
+            doc["historyUsesHeap"] = false;
+            char hash[65];
+            const auto *desc = esp_ota_get_app_description();
+            const char hex[] = "0123456789abcdef";
+            for (size_t n = 0; n < 32; ++n) {
+                hash[n * 2] = hex[desc->app_elf_sha256[n] >> 4];
+                hash[n * 2 + 1] = hex[desc->app_elf_sha256[n] & 15];
+            }
+            hash[64] = 0;
+            doc["elfSha256"] = hash;
+            String body;
+            serializeJson(doc, body);
+            sendJson(200, body);
+        });
+
+        activeServer()->on("/diagnostics/crash.json", HTTP_GET, [this]() {
+            activeServer()->sendHeader("Cache-Control", "no-store");
+            activeServer()->send(200, "application/json", BridgePanicRecorder::json());
+        });
+
+        activeServer()->on("/logs.json", HTTP_GET, [this]() {
+            handleLogsJson();
+        });
+
+        activeServer()->on("/backup", HTTP_GET, [this]() {
+            log_.println(F("HTTP GET /backup"));
+            sendConfigBackupPage();
+        });
+
+        activeServer()->on("/backup.json", HTTP_GET, [this]() {
+            log_.println(F("HTTP GET /backup.json"));
+            handleConfigDownload();
+        });
+
+        activeServer()->on("/backup/restore", HTTP_POST, [this]() {
+            log_.println(F("HTTP POST /backup/restore"));
+            if (!requirePortalPost("/backup/restore", {"configJson"}))
+                return;
+            handleConfigRestore();
+        });
+
+        activeServer()->on("/ota", HTTP_GET, [this]() {
+            log_.println(F("HTTP GET /ota"));
+            sendOtaPage();
+        });
+
+        activeServer()->on("/ota/status", HTTP_GET, [this]() {
+            log_.println(F("HTTP GET /ota/status"));
+            handleOtaStatus();
+        });
+
+        activeServer()->on("/ota/fetch", HTTP_POST, [this]() {
+            log_.println(F("HTTP POST /ota/fetch"));
+            if (!requirePortalPost("/ota/fetch", {}, true))
+                return;
+            handleOtaFetch();
+        });
+
+        activeServer()->on("/ota/upload/begin", HTTP_POST, [this]() {
+            log_.println(F("HTTP POST /ota/upload/begin"));
+            if (!requirePortalPost("/ota/upload/begin", {"plain"}, true))
+                return;
+            handleOtaUploadBegin();
+        });
+
+        activeServer()->on("/ota/upload/part/begin", HTTP_POST, [this]() {
+            log_.println(F("HTTP POST /ota/upload/part/begin"));
+            if (!requirePortalPost("/ota/upload/part/begin", {"path", "offset", "size"}, true))
+                return;
+            handleOtaUploadPartBegin();
+        });
+
+        activeServer()->on("/ota/upload/part/chunk", HTTP_POST, [this]() {
+            if (!requirePortalPost("/ota/upload/part/chunk", {"plain"}, true))
+                return;
+            handleOtaUploadPartChunk();
+        });
+
+        activeServer()->on("/ota/upload/part/finish", HTTP_POST, [this]() {
+            log_.println(F("HTTP POST /ota/upload/part/finish"));
+            if (!requirePortalPost("/ota/upload/part/finish", {"path"}, true))
+                return;
+            handleOtaUploadPartFinish();
+        });
+
+        activeServer()->on("/ota/upload/finish", HTTP_POST, [this]() {
+            log_.println(F("HTTP POST /ota/upload/finish"));
+            if (!requirePortalPost("/ota/upload/finish", {}, true))
+                return;
+            handleOtaUploadFinish();
+        });
+
+        activeServer()->on("/ota/cancel", HTTP_POST, [this]() {
+            log_.println(F("HTTP POST /ota/cancel"));
+            if (!requirePortalPost("/ota/cancel", {}, true))
+                return;
+            handleOtaCancel();
+        });
+
+        activeServer()->on("/restart", HTTP_GET, [this]() {
+            if (radProUpdater_ && radProUpdater_->blocksBridgeUpdate())
+            {
+                activeServer()->send(409, "text/plain", "Finish or cancel the detector update first.");
+                return;
+            }
+            log_.println(F("HTTP GET /restart"));
+            activeServer()->send(200, "text/plain", "Restarting...\n");
+            log_.println("Restart requested from Wi-Fi portal.");
+            delay(200);
+            ESP.restart();
+        });
+
+        activeServer()->onNotFound([this]() {
+            if (!activeServer())
+                return;
+            log_.print(F("Portal request not found: "));
+            log_.print(activeServer()->uri());
+            log_.print(F(" (method "));
+            log_.print(activeServer()->method());
+            log_.println(F(")"));
+            activeServer()->send(404, "text/plain", "Not found\n");        });
+}
+
+void WiFiPortalService::handleWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info)
+{
+    switch (event)
+    {
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+    {
+        IPAddress ip(info.got_ip.ip_info.ip.addr);
+        IPAddress gateway(info.got_ip.ip_info.gw.addr);
+        IPAddress netmask(info.got_ip.ip_info.netmask.addr);
+        logConnectionDetails(ip, gateway, netmask);
+        lastStatus_ = WL_CONNECTED;
+        pendingReconnect_ = false;
+        lastReconnectAttemptMs_ = 0;
+        waitingForIpSinceMs_ = 0;
+        resetGatewayMonitor(gateway);
+        led_.clearFault(FaultCode::WifiDhcpFailure);
+        led_.clearFault(FaultCode::WifiPortalStuck);
+        led_.clearFault(FaultCode::PortalReconnectFailed);
+        led_.clearFault(FaultCode::WifiAuthFailure);
+        break;
+    }
+    case ARDUINO_EVENT_WIFI_AP_START:
+        log_.print(F("SoftAP started. IP="));
+        log_.println(WiFi.softAPIP());
+        logPortalState("event:AP_START");
+        disablePortalPowerSave();
+        break;
+    case ARDUINO_EVENT_WIFI_AP_STOP:
+        log_.println(F("SoftAP stopped."));
+        logPortalState("event:AP_STOP");
+        restorePortalPowerSave();
+        break;
+    case ARDUINO_EVENT_WIFI_AP_STACONNECTED:
+    {
+        char mac[18] = {0};
+        snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 info.wifi_ap_staconnected.mac[0], info.wifi_ap_staconnected.mac[1], info.wifi_ap_staconnected.mac[2],
+                 info.wifi_ap_staconnected.mac[3], info.wifi_ap_staconnected.mac[4], info.wifi_ap_staconnected.mac[5]);
+        log_.print(F("AP client connected: "));
+        log_.print(mac);
+        log_.print(F(" AID="));
+        log_.println(info.wifi_ap_staconnected.aid);
+        logPortalState("event:AP_STACONNECTED");
+        break;
+    }
+    case ARDUINO_EVENT_WIFI_AP_STADISCONNECTED:
+    {
+        char mac[18] = {0};
+        snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 info.wifi_ap_stadisconnected.mac[0], info.wifi_ap_stadisconnected.mac[1], info.wifi_ap_stadisconnected.mac[2],
+                 info.wifi_ap_stadisconnected.mac[3], info.wifi_ap_stadisconnected.mac[4], info.wifi_ap_stadisconnected.mac[5]);
+        log_.print(F("AP client disconnected: "));
+        log_.print(mac);
+        log_.print(F(" AID="));
+        log_.println(info.wifi_ap_stadisconnected.aid);
+        logPortalState("event:AP_STADISCONNECTED");
+        break;
+    }
+    case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+    {
+        char ssid[33] = {0};
+        size_t len = std::min<size_t>(info.wifi_sta_connected.ssid_len, sizeof(ssid) - 1);
+        memcpy(ssid, info.wifi_sta_connected.ssid, len);
+        lastKnownSsid_ = String(ssid);
+        String passCandidate = WiFi.psk();
+        if (passCandidate.length())
+            lastKnownPass_ = passCandidate;
+        if (lastStatus_ != WL_CONNECTED)
+        {
+            log_.print("Wi-Fi connected to AP: ");
+            log_.println(ssid);
+        }
+        logPortalState("event:STA_CONNECTED");
+        lastStatus_ = WL_CONNECTED;
+        if (waitingForIpSinceMs_ == 0)
+        {
+            const unsigned long now = millis();
+            waitingForIpSinceMs_ = now == 0 ? 1 : now;
+        }
+        led_.clearFault(FaultCode::WifiAuthFailure);
+        break;
+    }
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+        if (lastStatus_ != WL_DISCONNECTED)
+        {
+            log_.print("Wi-Fi disconnected (reason ");
+            log_.print(info.wifi_sta_disconnected.reason);
+            log_.println(")");
+        }
+        logPortalState("event:STA_DISCONNECTED");
+        lastStatus_ = WL_DISCONNECTED;
+        hasLoggedIp_ = false;
+        lastIp_ = IPAddress();
+        {
+            bool portalActive = manager_.getConfigPortalActive();
+            bool haveCredentials = hasStoredCredentials();
+            bool onboarding = onboardingMode_ || !haveCredentials;
+            if (WiFiReconnectPolicy::shouldSuppressRetry(portalActive, onboarding, haveCredentials))
+            {
+                log_.println(F("Ignoring STA disconnect while captive portal is active/onboarding."));
+                pendingReconnect_ = false;
+                lastReconnectAttemptMs_ = 0;
+                waitingForIpSinceMs_ = 0;
+                break;
+            }
+        }
+        {
+            const bool alreadyPending = pendingReconnect_;
+            pendingReconnect_ = true;
+            lastReconnectAttemptMs_ = WiFiReconnectPolicy::lastAttemptAfterDisconnect(
+                alreadyPending, lastReconnectAttemptMs_);
+            if (!alreadyPending)
+                waitingForIpSinceMs_ = 0;
+        }
+        resetGatewayMonitor();
+        switch (info.wifi_sta_disconnected.reason)
+        {
+        case WIFI_REASON_AUTH_EXPIRE:
+        case WIFI_REASON_AUTH_FAIL:
+        case WIFI_REASON_HANDSHAKE_TIMEOUT:
+        case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+        case WIFI_REASON_ASSOC_EXPIRE:
+        case WIFI_REASON_ASSOC_LEAVE:
+        case WIFI_REASON_CONNECTION_FAIL:
+            led_.activateFault(FaultCode::WifiAuthFailure);
+            break;
+        default:
+            led_.activateFault(FaultCode::WifiDhcpFailure);
+            break;
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+void WiFiPortalService::logStatusIfNeeded()
+{
+    if (NetworkStatus::ethernetConnected())
+    {
+        if (loggingEnabled_ && (!hasLoggedIp_ || lastIp_ != ETH.localIP()))
+        {
+            lastIp_ = ETH.localIP();
+            hasLoggedIp_ = true;
+            log_.print(F("Ethernet connected: "));
+            log_.println(ETH.localIP());
+            log_.print(F("Gateway: "));
+            log_.print(ETH.gatewayIP());
+            log_.print(F("  Mask: "));
+            log_.println(ETH.subnetMask());
+        }
+        return;
+    }
+
+    wl_status_t current = WiFi.status();
+    if (current != lastStatus_)
+    {
+        lastStatus_ = current;
+        if (current == WL_CONNECTED)
+        {
+            hasLoggedIp_ = false;
+            if (loggingEnabled_)
+                logStatus();
+        }
+        else
+        {
+            lastIp_ = IPAddress();
+            hasLoggedIp_ = false;
+            if (loggingEnabled_)
+                log_.println("Wi-Fi not connected.");
+        }
+    }
+    else if (current == WL_CONNECTED && !hasLoggedIp_)
+    {
+        IPAddress ip = WiFi.localIP();
+        if (ip != IPAddress(0, 0, 0, 0))
+        {
+            logConnectionDetails(ip, WiFi.gatewayIP(), WiFi.subnetMask());
+        }
+    }
+}
+
+void WiFiPortalService::logConnectionDetails(const IPAddress &ip, const IPAddress &gateway, const IPAddress &mask)
+{
+    if (ip == IPAddress(0, 0, 0, 0))
+        return;
+    bool alreadyLogged = hasLoggedIp_ && (ip == lastIp_);
+    lastIp_ = ip;
+
+    if (!loggingEnabled_)
+    {
+        hasLoggedIp_ = false;
+        return;
+    }
+
+    if (alreadyLogged)
+        return;
+
+    log_.print("Wi-Fi connected: ");
+    log_.print(WiFi.SSID());
+    log_.print(" (");
+    log_.print(ip);
+    log_.println(")");
+    log_.print("Gateway: ");
+    log_.print(gateway);
+    log_.print("  Mask: ");
+    log_.println(mask);
+    log_.print("RSSI: ");
+    log_.print(WiFi.RSSI());
+    log_.println(" dBm");
+
+    hasLoggedIp_ = true;
+}
+
+void WiFiPortalService::logStatus()
+{
+    if (!loggingEnabled_)
+        return;
+
+    if (NetworkStatus::ethernetConnected())
+    {
+        lastIp_ = ETH.localIP();
+        hasLoggedIp_ = true;
+        log_.print(F("Ethernet connected: "));
+        log_.println(ETH.localIP());
+        log_.print(F("Gateway: "));
+        log_.print(ETH.gatewayIP());
+        log_.print(F("  Mask: "));
+        log_.println(ETH.subnetMask());
+        return;
+    }
+
+    wl_status_t status = WiFi.status();
+    if (status == WL_CONNECTED)
+    {
+        logConnectionDetails(WiFi.localIP(), WiFi.gatewayIP(), WiFi.subnetMask());
+    }
+    else
+    {
+        log_.println("Wi-Fi not connected.");
+    }
+}
+
+void WiFiPortalService::logPortalState(const char *context)
+{
+    if (ethernetPortalActive_)
+    {
+        log_.print(F("Portal state"));
+        if (context && context[0])
+        {
+            log_.print(F(" ("));
+            log_.print(context);
+            log_.print(F(")"));
+        }
+        log_.print(F(": Ethernet IP="));
+        log_.print(ETH.localIP());
+        log_.print(F(" webServer="));
+        log_.println(ethernetServerStarted_ ? F("yes") : F("no"));
+        return;
+    }
+
+    if (!wifiManagerInitialized_)
+    {
+        log_.println(F("Portal state: Wi-Fi not initialized."));
+        return;
+    }
+
+    log_.print(F("Portal state"));
+    if (context && context[0])
+    {
+        log_.print(F(" ("));
+        log_.print(context);
+        log_.print(F(")"));
+    }
+    log_.print(F(": status="));
+    log_.print(static_cast<int>(WiFi.status()));
+    log_.print(F(" configPortalActive="));
+    log_.print(manager_.getConfigPortalActive() ? F("yes") : F("no"));
+    log_.print(F(" webPortalActive="));
+    log_.print(manager_.getWebPortalActive() ? F("yes") : F("no"));
+    log_.print(F(" routesRegistered="));
+    log_.print(routesRegistered_ ? F("yes") : F("no"));
+
+    wifi_mode_t mode = WIFI_MODE_NULL;
+    if (esp_wifi_get_mode(&mode) == ESP_OK)
+    {
+        log_.print(F(" mode="));
+        switch (mode)
+        {
+        case WIFI_MODE_NULL:
+            log_.print(F("NULL"));
+            break;
+        case WIFI_MODE_STA:
+            log_.print(F("STA"));
+            break;
+        case WIFI_MODE_AP:
+            log_.print(F("AP"));
+            break;
+        case WIFI_MODE_APSTA:
+            log_.print(F("AP+STA"));
+            break;
+        default:
+            log_.print(static_cast<int>(mode));
+            break;
+        }
+    }
+
+    IPAddress staIp = WiFi.localIP();
+    IPAddress apIp = WiFi.softAPIP();
+    log_.print(F(" staIP="));
+    log_.print(staIp);
+    log_.print(F(" apIP="));
+    log_.print(apIp);
+    log_.print(F(" apClients="));
+    log_.print(WiFi.softAPgetStationNum());
+
+    String ssid = WiFi.SSID();
+    if (ssid.length())
+    {
+        log_.print(F(" ssid=\""));
+        log_.print(ssid);
+        log_.print(F("\""));
+    }
+    String apSsid = WiFi.softAPSSID();
+    if (apSsid.length())
+    {
+        log_.print(F(" apSsid=\""));
+        log_.print(apSsid);
+        log_.print(F("\""));
+    }
+    log_.println();
+}
+
+bool WiFiPortalService::hasStoredCredentials() const
+{
+    wifi_config_t conf;
+    if (esp_wifi_get_config(WIFI_IF_STA, &conf) == ESP_OK)
+    {
+        if (conf.sta.ssid[0] != 0)
+            return true;
+    }
+
+    if (WiFi.SSID().length())
+        return true;
+    if (WiFi.psk().length())
+        return true;
+    return false;
+}
+
+void WiFiPortalService::prepareConfigPortalAp(const String &ssid)
+{
+    pendingReconnect_ = false;
+    lastReconnectAttemptMs_ = 0;
+    waitingForIpSinceMs_ = 0;
+    log_.print(F("Preparing config portal AP for SSID '"));
+    log_.print(ssid);
+    log_.println(F("' (manager will start AP)."));
+}
+
+void WiFiPortalService::scheduleRestart(const char *reason)
+{
+    restartScheduled_ = true;
+    restartAtMs_ = millis() + 1500;
+    log_.print(F("Restart scheduled"));
+    if (reason && reason[0])
+    {
+        log_.print(F(" ("));
+        log_.print(reason);
+        log_.print(F(")"));
+    }
+    log_.println(F("."));
+}
+
+void WiFiPortalService::disablePortalPowerSave()
+{
+    if (portalPsDisabled_)
+        return;
+
+    wifi_ps_type_t current;
+    if (esp_wifi_get_ps(&current) == ESP_OK)
+        previousPsType_ = current;
+
+    if (esp_wifi_set_ps(WIFI_PS_NONE) == ESP_OK)
+    {
+        portalPsDisabled_ = true;
+        log_.println("Wi-Fi power save disabled for captive portal.");
+        esp_wifi_set_max_tx_power(78); // ~19.5 dBm
+    }
+}
+
+void WiFiPortalService::restorePortalPowerSave()
+{
+    if (!portalPsDisabled_)
+        return;
+
+    if (esp_wifi_set_ps(previousPsType_) == ESP_OK)
+    {
+        log_.println("Wi-Fi power save restored.");
+    }
+    portalPsDisabled_ = false;
+}
+
+void WiFiPortalService::resetGatewayMonitor(const IPAddress &gateway)
+{
+    ++gatewayLeaseGeneration_;
+    monitoredGateway_ = gateway;
+    lastGatewayProbeMs_ = 0;
+    WiFiReconnectPolicy::resetGatewayHealth(gatewayHealth_);
+}
+
+void WiFiPortalService::maintainGatewayMonitor(bool connected)
+{
+    bool probeFinished = false;
+    bool probeSucceeded = false;
+    uint32_t probeGeneration = 0;
+
+    portENTER_CRITICAL(&gatewayProbeLock_);
+    if (gatewayProbeFinished_)
+    {
+        probeFinished = true;
+        probeSucceeded = gatewayProbeSucceeded_;
+        probeGeneration = gatewayProbeResultGeneration_;
+        gatewayProbeFinished_ = false;
+        gatewayProbeSucceeded_ = false;
+    }
+    portEXIT_CRITICAL(&gatewayProbeLock_);
+
+    if (probeFinished)
+    {
+        gatewayProbeInFlight_ = false;
+        if (connected && probeGeneration == gatewayLeaseGeneration_)
+        {
+            const uint8_t previousFailures = gatewayHealth_.consecutiveFailures;
+            const WiFiReconnectPolicy::GatewayProbeOutcome outcome =
+                WiFiReconnectPolicy::recordGatewayProbe(gatewayHealth_, probeSucceeded);
+
+            switch (outcome)
+            {
+            case WiFiReconnectPolicy::GatewayProbeOutcome::Armed:
+                log_.print(F("Wi-Fi gateway monitor armed after successful probe to "));
+                log_.println(monitoredGateway_);
+                break;
+            case WiFiReconnectPolicy::GatewayProbeOutcome::Healthy:
+                if (previousFailures > 0)
+                    log_.println(F("Wi-Fi gateway probe recovered."));
+                break;
+            case WiFiReconnectPolicy::GatewayProbeOutcome::Suspect:
+                log_.print(F("Wi-Fi gateway probe failed ("));
+                log_.print(gatewayHealth_.consecutiveFailures);
+                log_.print('/');
+                log_.print(WiFiReconnectPolicy::kGatewayFailureThreshold);
+                log_.println(F(")."));
+                break;
+            case WiFiReconnectPolicy::GatewayProbeOutcome::Stale:
+                log_.print(F("Wi-Fi gateway unreachable after "));
+                log_.print(gatewayHealth_.consecutiveFailures);
+                log_.println(F(" probes; forcing stale-link recovery."));
+                resetGatewayMonitor();
+                pendingReconnect_ = true;
+                lastReconnectAttemptMs_ = 0;
+                waitingForIpSinceMs_ = 0;
+                attemptReconnect();
+                return;
+            case WiFiReconnectPolicy::GatewayProbeOutcome::IgnoredUntilProven:
+                break;
+            }
+        }
+    }
+
+    if (!connected || pendingReconnect_ || gatewayProbeInFlight_ ||
+        monitoredGateway_ == IPAddress(0, 0, 0, 0))
+    {
+        return;
+    }
+
+    const unsigned long now = millis();
+    if (lastGatewayProbeMs_ != 0 &&
+        now - lastGatewayProbeMs_ < WiFiReconnectPolicy::kGatewayProbeIntervalMs)
+    {
+        return;
+    }
+
+    startGatewayProbe(monitoredGateway_, now);
+}
+
+bool WiFiPortalService::startGatewayProbe(const IPAddress &gateway, unsigned long now)
+{
+    lastGatewayProbeMs_ = now == 0 ? 1 : now;
+
+    esp_ping_config_t config = ESP_PING_DEFAULT_CONFIG();
+    config.count = 1;
+    config.timeout_ms = 1000;
+    IP4_ADDR(ip_2_ip4(&config.target_addr), gateway[0], gateway[1], gateway[2], gateway[3]);
+    IP_SET_TYPE_VAL(config.target_addr, IPADDR_TYPE_V4);
+
+    esp_ping_callbacks_t callbacks = {};
+    callbacks.cb_args = this;
+    callbacks.on_ping_success = &WiFiPortalService::onGatewayPingSuccess;
+    callbacks.on_ping_timeout = &WiFiPortalService::onGatewayPingTimeout;
+    callbacks.on_ping_end = &WiFiPortalService::onGatewayPingEnd;
+
+    esp_ping_handle_t handle = nullptr;
+    esp_err_t err = esp_ping_new_session(&config, &callbacks, &handle);
+    if (err != ESP_OK)
+    {
+        log_.print(F("Could not create Wi-Fi gateway probe: "));
+        log_.println(esp_err_to_name(err));
+        return false;
+    }
+
+    portENTER_CRITICAL(&gatewayProbeLock_);
+    gatewayProbeSucceeded_ = false;
+    gatewayProbeFinished_ = false;
+    portEXIT_CRITICAL(&gatewayProbeLock_);
+    gatewayProbeGeneration_ = gatewayLeaseGeneration_;
+    gatewayProbeInFlight_ = true;
+
+    err = esp_ping_start(handle);
+    if (err != ESP_OK)
+    {
+        gatewayProbeInFlight_ = false;
+        esp_ping_delete_session(handle);
+        log_.print(F("Could not start Wi-Fi gateway probe: "));
+        log_.println(esp_err_to_name(err));
+        return false;
+    }
+
+    return true;
+}
+
+void WiFiPortalService::onGatewayPingSuccess(esp_ping_handle_t, void *args)
+{
+    WiFiPortalService *service = static_cast<WiFiPortalService *>(args);
+    portENTER_CRITICAL(&service->gatewayProbeLock_);
+    service->gatewayProbeSucceeded_ = true;
+    portEXIT_CRITICAL(&service->gatewayProbeLock_);
+}
+
+void WiFiPortalService::onGatewayPingTimeout(esp_ping_handle_t, void *)
+{
+}
+
+void WiFiPortalService::onGatewayPingEnd(esp_ping_handle_t handle, void *args)
+{
+    WiFiPortalService *service = static_cast<WiFiPortalService *>(args);
+    esp_ping_delete_session(handle);
+
+    portENTER_CRITICAL(&service->gatewayProbeLock_);
+    service->gatewayProbeResultGeneration_ = service->gatewayProbeGeneration_;
+    service->gatewayProbeFinished_ = true;
+    portEXIT_CRITICAL(&service->gatewayProbeLock_);
+}
+
+void WiFiPortalService::attemptReconnect()
+{
+    const unsigned long now = millis();
+    lastReconnectAttemptMs_ = now == 0 ? 1 : now;
+    waitingForIpSinceMs_ = lastReconnectAttemptMs_;
+    log_.println("Wi-Fi reconnect pending; attempting to rejoin.");
+
+    WiFiReconnectPolicy::StationMode mode = WiFiReconnectPolicy::reconnectMode(manager_.getConfigPortalActive());
+    WiFi.mode(mode == WiFiReconnectPolicy::StationMode::ApAndStation ? WIFI_AP_STA : WIFI_STA);
+
+    if (WiFi.reconnect())
+    {
+        log_.println("Wi-Fi reconnect requested via reconnect().");
+        return;
+    }
+
+    String ssid = lastKnownSsid_.length() ? lastKnownSsid_ : WiFi.SSID();
+    String pass = lastKnownPass_.length() ? lastKnownPass_ : WiFi.psk();
+
+    if (ssid.length())
+    {
+        if (pass.length())
+        {
+            log_.print("Wi-Fi.begin(");
+            log_.print(ssid);
+            log_.println(") with passphrase.");
+            WiFi.begin(ssid.c_str(), pass.c_str());
+        }
+        else
+        {
+            log_.print("Wi-Fi.begin(");
+            log_.print(ssid);
+            log_.println(") without passphrase.");
+            WiFi.begin(ssid.c_str());
+        }
+    }
+    else
+    {
+        log_.println("Wi-Fi.begin() with stored credentials.");
+        WiFi.begin();
+    }
+}
+
+#include <Arduino.h>
+#include <ArduinoJson.h>
+#include <FS.h>
+#include <LittleFS.h>
+
+void WiFiPortalService::sendConfigBackupPage(const String &message)
+{
+    if (!activeServer())
+        return;
+
+    bool isError = message.startsWith(F("ERROR:"));
+    String display = isError ? message.substring(6) : message;
+    display.trim();
+
+    String noticeClass;
+    if (!display.length())
+    {
+        noticeClass = "hidden";
+    }
+    else
+    {
+        noticeClass = isError ? "error" : "success";
+    }
+
+    TemplateReplacements vars = {
+        {"{{NOTICE_CLASS}}", noticeClass},
+        {"{{NOTICE_TEXT}}", htmlEscape(display)}};
+
+    appendCommonTemplateVars(vars);
+    sendTemplate("/portal/backup.html", vars);
+}
+
+
+void WiFiPortalService::handleConfigDownload()
+{
+    if (!activeServer())
+        return;
+
+    auto &server = *activeServer();
+
+    String json = exportConfigJson();
+    server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+    server.sendHeader("Pragma", "no-cache");
+    server.sendHeader("Expires", "0");
+    server.sendHeader("Content-Disposition", "attachment; filename=\"radpro-wifi-bridge-config.json\"");
+    server.send(200, "application/json", json);
+}
+
+void WiFiPortalService::handleConfigRestore()
+{
+    if (!activeServer())
+        return;
+
+    auto &server = *activeServer();
+    String body;
+    if (server.hasArg("configJson"))
+        body = server.arg("configJson");
+    else if (server.hasArg("plain"))
+        body = server.arg("plain");
+
+    body.trim();
+    if (!body.length())
+    {
+        sendConfigBackupPage(F("ERROR: No configuration data received."));
+        return;
+    }
+
+    String error;
+    if (importConfigJson(body, error))
+    {
+        sendConfigBackupPage(F("Configuration restored. The bridge will reconnect with the imported settings."));
+
+        // Close portal and reboot into the restored configuration for a clean start.
+        if (manager_.getConfigPortalActive())
+            manager_.stopConfigPortal();
+        if (manager_.getWebPortalActive())
+            manager_.stopWebPortal();
+
+        onboardingMode_ = false;
+        pendingReconnect_ = false;
+        lastReconnectAttemptMs_ = 0;
+        waitingForIpSinceMs_ = 0;
+        hasLoggedIp_ = false;
+        scheduleRestart("config restore");
+    }
+    else
+    {
+        sendConfigBackupPage(String(F("ERROR: ")) + error);
+    }
+}
+
+String WiFiPortalService::exportConfigJson() const
+{
+    JsonDocument doc;
+    doc["schema"] = "radpro-wifi-bridge-config";
+    doc["bridgeFirmware"] = BRIDGE_FIRMWARE_VERSION;
+    doc["generatedMs"] = millis();
+    doc["deviceName"] = config_.deviceName;
+    doc["mqttEnabled"] = config_.mqttEnabled;
+    doc["mqttHost"] = config_.mqttHost;
+    doc["mqttPort"] = config_.mqttPort;
+    doc["mqttClient"] = config_.mqttClient;
+    doc["mqttUser"] = config_.mqttUser;
+    doc["mqttPassword"] = config_.mqttPassword;
+    doc["mqttTopic"] = config_.mqttTopic;
+    doc["mqttFullTopic"] = config_.mqttFullTopic;
+    doc["readIntervalMs"] = config_.readIntervalMs;
+    UsbRecoverySettings::appendConfig(doc, config_);
+    doc["openSenseMapEnabled"] = config_.openSenseMapEnabled;
+    doc["openSenseBoxId"] = config_.openSenseBoxId;
+    doc["openSenseApiKey"] = config_.openSenseApiKey;
+    doc["openSenseTubeRateSensorId"] = config_.openSenseTubeRateSensorId;
+    doc["openSenseDoseRateSensorId"] = config_.openSenseDoseRateSensorId;
+    doc["gmcMapEnabled"] = config_.gmcMapEnabled;
+    doc["gmcMapAccountId"] = config_.gmcMapAccountId;
+    doc["gmcMapDeviceId"] = config_.gmcMapDeviceId;
+    doc["radmonEnabled"] = config_.radmonEnabled;
+    doc["radmonUser"] = config_.radmonUser;
+    doc["radmonPassword"] = config_.radmonPassword;
+    doc["openRadiationEnabled"] = config_.openRadiationEnabled;
+    doc["openRadiationDeviceId"] = config_.openRadiationDeviceId;
+    doc["openRadiationApiKey"] = config_.openRadiationApiKey;
+    doc["openRadiationLatitude"] = config_.openRadiationLatitude;
+    doc["openRadiationLongitude"] = config_.openRadiationLongitude;
+    doc["openRadiationAltitude"] = config_.openRadiationAltitude;
+    doc["openRadiationAccuracy"] = config_.openRadiationAccuracy;
+    OpenRadiationBackupJson::appendMeasurementConfig(doc, config_);
+    SafecastBackupJson::appendConfig(doc, config_);
+
+    String json;
+    serializeJsonPretty(doc, json);
+    return json;
+}
+
+bool WiFiPortalService::importConfigJson(const String &body, String &errorMessage)
+{
+    errorMessage = String();
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, body);
+    if (err)
+    {
+        errorMessage = String(F("Invalid JSON: ")) + err.c_str();
+        return false;
+    }
+
+    AppConfig updated = config_;
+
+    auto setString = [](String &target, JsonVariantConst value)
+    {
+        if (value.isNull())
+            return;
+        if (value.is<const char *>())
+        {
+            String s(value.as<const char *>());
+            s.trim();
+            target = s;
+        }
+        else if (value.is<String>())
+        {
+            String s = value.as<String>();
+            s.trim();
+            target = s;
+        }
+    };
+
+    auto setBool = [](bool &target, JsonVariantConst value)
+    {
+        if (!value.isNull())
+            target = value.as<bool>();
+    };
+
+    auto setUint16 = [](uint16_t &target, JsonVariantConst value)
+    {
+        if (value.isNull())
+            return;
+        uint32_t temp = value.as<uint32_t>();
+        if (temp == 0 || temp > 65535)
+            return;
+        target = static_cast<uint16_t>(temp);
+    };
+
+    auto setUint32 = [](uint32_t &target, JsonVariantConst value)
+    {
+        if (value.isNull())
+            return;
+        uint32_t temp = value.as<uint32_t>();
+        target = temp;
+    };
+
+    auto setFloat = [](float &target, JsonVariantConst value, float minValue, float maxValue)
+    {
+        if (value.isNull())
+            return;
+        float parsed = value.as<float>();
+        if (parsed < minValue)
+            parsed = minValue;
+        if (parsed > maxValue)
+            parsed = maxValue;
+        target = parsed;
+    };
+
+    setString(updated.deviceName, doc["deviceName"]);
+    setBool(updated.mqttEnabled, doc["mqttEnabled"]);
+    setString(updated.mqttHost, doc["mqttHost"]);
+    setUint16(updated.mqttPort, doc["mqttPort"]);
+    setString(updated.mqttClient, doc["mqttClient"]);
+    setString(updated.mqttUser, doc["mqttUser"]);
+    setString(updated.mqttPassword, doc["mqttPassword"]);
+    setString(updated.mqttTopic, doc["mqttTopic"]);
+    setString(updated.mqttFullTopic, doc["mqttFullTopic"]);
+    setUint32(updated.readIntervalMs, doc["readIntervalMs"]);
+    if (!UsbRecoverySettings::applyConfig(doc.as<JsonVariantConst>(), updated))
+    {
+        errorMessage = F("USB recovery timeout must be 0 (disabled) or 60–3600 seconds.");
+        return false;
+    }
+    setBool(updated.openSenseMapEnabled, doc["openSenseMapEnabled"]);
+    setString(updated.openSenseBoxId, doc["openSenseBoxId"]);
+    setString(updated.openSenseApiKey, doc["openSenseApiKey"]);
+    setString(updated.openSenseTubeRateSensorId, doc["openSenseTubeRateSensorId"]);
+    setString(updated.openSenseDoseRateSensorId, doc["openSenseDoseRateSensorId"]);
+    setBool(updated.gmcMapEnabled, doc["gmcMapEnabled"]);
+    setString(updated.gmcMapAccountId, doc["gmcMapAccountId"]);
+    setString(updated.gmcMapDeviceId, doc["gmcMapDeviceId"]);
+    setBool(updated.radmonEnabled, doc["radmonEnabled"]);
+    setString(updated.radmonUser, doc["radmonUser"]);
+    setString(updated.radmonPassword, doc["radmonPassword"]);
+    setBool(updated.openRadiationEnabled, doc["openRadiationEnabled"]);
+    setString(updated.openRadiationDeviceId, doc["openRadiationDeviceId"]);
+    setString(updated.openRadiationApiKey, doc["openRadiationApiKey"]);
+    setFloat(updated.openRadiationLatitude, doc["openRadiationLatitude"], -90.0f, 90.0f);
+    setFloat(updated.openRadiationLongitude, doc["openRadiationLongitude"], -180.0f, 180.0f);
+    setFloat(updated.openRadiationAltitude, doc["openRadiationAltitude"], -10000.0f, 100000.0f);
+    setFloat(updated.openRadiationAccuracy, doc["openRadiationAccuracy"], 0.0f, 100000.0f);
+    OpenRadiationBackupJson::applyMeasurementConfig(doc.as<JsonVariantConst>(), updated);
+    SafecastBackupJson::applyConfig(doc.as<JsonVariantConst>(), updated);
+
+    if (updated.readIntervalMs < kMinReadIntervalMs)
+        updated.readIntervalMs = kMinReadIntervalMs;
+
+    const std::vector<String> changedFields = collectChangedConfigFields(config_, updated);
+    if (!store_.save(updated))
+    {
+        errorMessage = F("Failed to save configuration to NVS.");
+        PortalSecurity::logConfigSaveFailure(log_, "/backup/restore", currentClientIp(), changedFields);
+        led_.activateFault(FaultCode::NvsWriteFailure);
+        return false;
+    }
+
+    config_ = updated;
+    refreshParameters();
+    led_.clearFault(FaultCode::NvsWriteFailure);
+    pendingReconnect_ = true;
+    lastReconnectAttemptMs_ = 0;
+    hasLoggedIp_ = false;
+    logConfigSave("/backup/restore", changedFields);
+    return true;
+}
+
+void WiFiPortalService::sendSafecastForm(const AppConfig &viewConfig,
+                                         const String &message,
+                                         const String &resultHtml)
+{
+    if (!activeServer())
+        return;
+
+    const String apiKeyPlaceholder = SafecastLogRedaction::maskSecretForDisplay(viewConfig.safecastApiKey);
+    const String effectiveBaseUrl = SafecastProtocol::resolveBaseUrl(
+        viewConfig.safecastApiBaseUrl,
+        viewConfig.safecastUseTestApi,
+        viewConfig.safecastCustomApiBaseUrl);
+
+    TemplateReplacements vars = {
+        {"{{NOTICE_CLASS}}", message.length() ? String() : String("hidden")},
+        {"{{NOTICE_TEXT}}", htmlEscape(message)},
+        {"{{RESULT_BLOCK}}", resultHtml},
+        {"{{SAFECAST_ENABLED_CHECKED}}", viewConfig.safecastEnabled ? String("checked") : String()},
+        {"{{SAFECAST_API_BASE_URL}}", htmlEscape(viewConfig.safecastApiBaseUrl)},
+        {"{{SAFECAST_EFFECTIVE_API_BASE_URL}}", htmlEscape(effectiveBaseUrl)},
+        {"{{SAFECAST_API_KEY_PLACEHOLDER}}", htmlEscape(apiKeyPlaceholder)},
+        {"{{SAFECAST_DEVICE_ID}}", htmlEscape(viewConfig.safecastDeviceId)},
+        {"{{SAFECAST_LATITUDE}}", htmlEscape(viewConfig.safecastLatitude)},
+        {"{{SAFECAST_LONGITUDE}}", htmlEscape(viewConfig.safecastLongitude)},
+        {"{{SAFECAST_HEIGHT_CM}}", htmlEscape(viewConfig.safecastHeightCm)},
+        {"{{SAFECAST_LOCATION_NAME}}", htmlEscape(viewConfig.safecastLocationName)},
+        {"{{SAFECAST_UNIT_CPM_CHECKED}}", viewConfig.safecastUnit.equalsIgnoreCase("cpm") ? String("checked") : String()},
+        {"{{SAFECAST_UNIT_USV_CHECKED}}", viewConfig.safecastUnit.equalsIgnoreCase("usv") ? String("checked") : String()},
+        {"{{SAFECAST_UPLOAD_INTERVAL_SECONDS}}", String(viewConfig.safecastUploadIntervalSeconds)},
+        {"{{SAFECAST_USE_TEST_API_CHECKED}}", viewConfig.safecastUseTestApi ? String("checked") : String()},
+        {"{{SAFECAST_CUSTOM_API_BASE_URL}}", htmlEscape(viewConfig.safecastCustomApiBaseUrl)},
+        {"{{SAFECAST_DEBUG_CHECKED}}", viewConfig.safecastDebug ? String("checked") : String()}};
+
+    appendCommonTemplateVars(vars);
+    sendTemplate("/portal/safecast.html", vars);
+}
+
+void WiFiPortalService::handleSafecastPost()
+{
+    if (!activeServer())
+        return;
+
+    auto &server = *activeServer();
+    AppConfig candidate = config_;
+
+    candidate.safecastEnabled = server.hasArg("safecastEnabled") && server.arg("safecastEnabled") == "1";
+    candidate.safecastUseTestApi = server.hasArg("safecastUseTestApi") && server.arg("safecastUseTestApi") == "1";
+    candidate.safecastDebug = server.hasArg("safecastDebug") && server.arg("safecastDebug") == "1";
+
+    String action = server.arg("safecastAction");
+    String baseUrl = server.arg("safecastApiBaseUrl");
+    String customBaseUrl = server.arg("safecastCustomApiBaseUrl");
+    String apiKey = server.arg("safecastApiKey");
+    String deviceId = server.arg("safecastDeviceId");
+    String latitude = server.arg("safecastLatitude");
+    String longitude = server.arg("safecastLongitude");
+    String heightCm = server.arg("safecastHeightCm");
+    String locationName = server.arg("safecastLocationName");
+    String unit = server.arg("safecastUnit");
+    String uploadInterval = server.arg("safecastUploadIntervalSeconds");
+
+    action.trim();
+    baseUrl.trim();
+    customBaseUrl.trim();
+    apiKey.trim();
+    deviceId.trim();
+    latitude.trim();
+    longitude.trim();
+    heightCm.trim();
+    locationName.trim();
+    unit.trim();
+    uploadInterval.trim();
+
+    candidate.safecastApiBaseUrl = baseUrl.length()
+                                       ? SafecastProtocol::normalizeBaseUrl(baseUrl)
+                                       : String(SafecastProtocol::kProductionApiBaseUrl);
+    candidate.safecastCustomApiBaseUrl = customBaseUrl.length()
+                                             ? SafecastProtocol::normalizeBaseUrl(customBaseUrl)
+                                             : String();
+    if (apiKey.length())
+        candidate.safecastApiKey = apiKey;
+    candidate.safecastDeviceId = deviceId;
+    candidate.safecastLatitude = latitude;
+    candidate.safecastLongitude = longitude;
+    candidate.safecastHeightCm = heightCm;
+    candidate.safecastLocationName = locationName;
+    candidate.safecastUnit = unit;
+
+    uint32_t uploadIntervalSeconds = 0;
+    if (!parseUnsignedText(uploadInterval, uploadIntervalSeconds))
+    {
+        sendSafecastForm(candidate, "Upload interval must be numeric.");
+        return;
+    }
+    candidate.safecastUploadIntervalSeconds = uploadIntervalSeconds;
+
+    SafecastConfig::ResolvedConfig resolved;
+    const bool requirePublishableFields = candidate.safecastEnabled || action == "test";
+    const SafecastConfig::Error validationError = SafecastConfig::resolve(candidate, resolved, requirePublishableFields);
+    if (validationError != SafecastConfig::Error::None)
+    {
+        sendSafecastForm(candidate, SafecastConfig::errorText(validationError));
+        return;
+    }
+
+    if (action == "test")
+    {
+        if (!safecastPublisher_)
+        {
+            sendSafecastForm(candidate, "Safecast test upload is unavailable.");
+            return;
+        }
+
+        const SafecastPublisher::UploadResult result = safecastPublisher_->sendTestUpload(candidate);
+        String message = result.success ? String("Safecast test upload finished.") : String();
+        if (!result.success && !result.statusCode && result.errorMessage.length())
+            message = result.errorMessage;
+        sendSafecastForm(candidate, message, formatSafecastResultHtml(result));
+        return;
+    }
+
+    const std::vector<String> changedFields = collectChangedConfigFields(config_, candidate);
+    config_ = candidate;
+    if (store_.save(config_))
+    {
+        refreshParameters();
+        logConfigSave("/safecast", changedFields);
+        led_.clearFault(FaultCode::NvsWriteFailure);
+        sendSafecastForm(config_, "Safecast settings saved.");
+        return;
+    }
+
+    PortalSecurity::logConfigSaveFailure(log_, "/safecast", currentClientIp(), changedFields);
+    log_.println("Preferences write failed; Safecast configuration not saved.");
+    led_.activateFault(FaultCode::NvsWriteFailure);
+    sendSafecastForm(candidate, "Failed to save settings.");
+}
+
+void WiFiPortalService::sendOpenRadiationForm(const String &message)
+{
+    if (!activeServer())
+        return;
+
+    const PublisherHealthSnapshot health = openRadiationHealth_.snapshot();
+    const String mapUrl = OpenRadiationPortalLinks::buildOpenRadiationMapUrl(
+        config_.openRadiationLatitude,
+        config_.openRadiationLongitude);
+    const String latestPath = health.lastReportUuid.length() ? String("/openradiation/latest") : String();
+
+    String html;
+    html.reserve(3200);
+    html += F("<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'/>"
+              "<title>Configure OpenRadiation</title>"
+              "<style>body{font-family:Arial,Helvetica,sans-serif;background:#111;color:#eee;margin:0;padding:24px;display:flex;justify-content:center;}"
+              "h1{margin-top:0;}form{display:flex;flex-direction:column;gap:12px;width:100%;}"
+              "label{font-weight:bold;}input,select{padding:8px;border-radius:4px;border:1px solid #666;background:#222;color:#eee;width:100%;}"
+              "button{padding:10px;border:none;border-radius:4px;background:#2196F3;color:#fff;font-size:15px;cursor:pointer;width:100%;}"
+              "button:hover{background:#1976D2;} .wrap{display:inline-block;min-width:260px;max-width:520px;width:100%;text-align:left;}"
+              "p.notice{margin:0 0 12px 0;color:#8bc34a;} .toggle{display:flex;align-items:center;gap:10px;font-weight:normal;}"
+              ".toggle input{width:auto;}</style>");
+    html += kPortalHeadElement;
+    html += F("</head><body class='invert'><div class='wrap'><h1>OpenRadiation Settings</h1>");
+
+    if (message.length())
+    {
+        html += F("<p class='notice'>");
+        html += message;
+        html += F("</p>");
+    }
+
+    ensureCsrfToken();
+    html += F("<form method='POST' action='/openradiation'>");
+    html += csrfHiddenInput();
+    html += F("<label class='toggle'><input id='orEnabled' name='orEnabled' type='checkbox' value='1'");
+    if (config_.openRadiationEnabled)
+        html += F(" checked");
+    html += F("> Enable OpenRadiation publishing</label>");
+
+    html += F("<label for='orDeviceId'>Apparatus ID / Device ID (optional)</label><input id='orDeviceId' name='orDeviceId' type='text' value='");
+    html += htmlEscape(config_.openRadiationDeviceId);
+    html += F("'/>");
+    html += F("<p style='margin:-4px 0 0 0;color:#bbb;font-size:13px;'>Leave blank to use the connected detector&apos;s device ID automatically.</p>");
+
+    html += F("<label for='orApiKey'>API Key</label><input id='orApiKey' name='orApiKey' type='password' value='");
+    html += htmlEscape(config_.openRadiationApiKey);
+    html += F("'/>");
+
+    html += F("<label for='orUserId'>OpenRadiation User ID / Pseudo</label><input id='orUserId' name='orUserId' type='text' value='");
+    html += htmlEscape(config_.openRadiationUserId);
+    html += F("'/>");
+
+    html += F("<label for='orUserPwd'>OpenRadiation User Password</label><input id='orUserPwd' name='orUserPwd' type='password' value='");
+    html += htmlEscape(config_.openRadiationUserPassword);
+    html += F("'/>");
+    html += F("<p style='margin:-4px 0 0 0;color:#bbb;font-size:13px;'>The bridge stores these credentials locally in NVS, includes them in outgoing measurement payloads, and redacts them in dry-run previews.</p>");
+
+    html += F("<label for='orLatitude'>Latitude</label><input id='orLatitude' name='orLatitude' type='number' step='0.000001' min='-90' max='90' value='");
+    html += String(config_.openRadiationLatitude, 6);
+    html += F("'/>");
+
+    html += F("<label for='orLongitude'>Longitude</label><input id='orLongitude' name='orLongitude' type='number' step='0.000001' min='-180' max='180' value='");
+    html += String(config_.openRadiationLongitude, 6);
+    html += F("'/>");
+
+    html += F("<label for='orAltitude'>Altitude (m, optional)</label><input id='orAltitude' name='orAltitude' type='number' step='0.1' value='");
+    html += String(config_.openRadiationAltitude, 1);
+    html += F("'/>");
+
+    html += F("<label for='orAccuracy'>Position Accuracy (m, optional)</label><input id='orAccuracy' name='orAccuracy' type='number' step='0.1' min='0' value='");
+    html += String(config_.openRadiationAccuracy, 1);
+    html += F("'/>");
+
+    html += F("<label for='orMeasurementEnvironment'>Measurement Environment</label><select id='orMeasurementEnvironment' name='orMeasurementEnvironment'>");
+    html += F("<option value=''");
+    if (!config_.openRadiationMeasurementEnvironment.length())
+        html += F(" selected");
+    html += F(">Unset</option>");
+    html += OpenRadiationPortalView::buildMeasurementEnvironmentOptions(config_.openRadiationMeasurementEnvironment);
+    html += F("</select>");
+
+    html += F("<label for='orMeasurementHeight'>Measurement Height Above Ground (m, optional)</label><input id='orMeasurementHeight' name='orMeasurementHeight' type='number' step='0.1' min='0' max='100' value='");
+    html += String(config_.openRadiationMeasurementHeight, 1);
+    html += F("'/>");
+
+    html += OpenRadiationPortalView::buildLinksSection(mapUrl, latestPath);
+    html += F("<p style='margin:0 0 16px 0;'><a href='/openradiation/dry-run' target='_blank' rel='noopener'>Preview dry-run payload (redacted, no submission)</a></p>");
+    html += F("<button type='submit'>Save OpenRadiation Settings</button></form>"
+              "<form action='/' method='get' style='margin-top:20px;'><button class='btn btn-primary' type='submit'>Main menu</button></form>"
+              "</div></body></html>");
+
+    activeServer()->send(200, "text/html", html);
+}
+
+void WiFiPortalService::handleOpenRadiationPost()
+{
+    if (!activeServer())
+        return;
+
+    auto &server = *activeServer();
+    bool enabled = server.hasArg("orEnabled") && server.arg("orEnabled") == "1";
+    String deviceId = server.arg("orDeviceId");
+    String apiKey = server.arg("orApiKey");
+    String userId = server.arg("orUserId");
+    String userPassword = server.arg("orUserPwd");
+    String latStr = server.arg("orLatitude");
+    String lonStr = server.arg("orLongitude");
+    String altStr = server.arg("orAltitude");
+    String accStr = server.arg("orAccuracy");
+    String environmentStr = server.arg("orMeasurementEnvironment");
+    String measurementHeightStr = server.arg("orMeasurementHeight");
+
+    deviceId.trim();
+    apiKey.trim();
+    userId.trim();
+    latStr.trim();
+    lonStr.trim();
+    altStr.trim();
+    accStr.trim();
+    environmentStr.trim();
+    measurementHeightStr.trim();
+
+    bool changed = false;
+    std::vector<String> changedFields;
+    if (config_.openRadiationEnabled != enabled)
+    {
+        config_.openRadiationEnabled = enabled;
+        PortalSecurity::appendChangedField(changedFields, "openRadiationEnabled", true);
+        changed = true;
+    }
+    bool fieldChanged = UpdateStringIfChanged(config_.openRadiationDeviceId, deviceId.c_str());
+    PortalSecurity::appendChangedField(changedFields, "openRadiationDeviceId", fieldChanged);
+    changed |= fieldChanged;
+    fieldChanged = UpdateStringIfChanged(config_.openRadiationApiKey, apiKey.c_str());
+    PortalSecurity::appendChangedField(changedFields, "openRadiationApiKey", fieldChanged);
+    changed |= fieldChanged;
+    fieldChanged = UpdateStringIfChanged(config_.openRadiationUserId, userId.c_str());
+    PortalSecurity::appendChangedField(changedFields, "openRadiationUserId", fieldChanged);
+    changed |= fieldChanged;
+    if (config_.openRadiationUserPassword != userPassword)
+    {
+        config_.openRadiationUserPassword = userPassword;
+        PortalSecurity::appendChangedField(changedFields, "openRadiationUserPassword", true);
+        changed = true;
+    }
+
+    auto updateFloat = [&](const char *fieldName, float &target, const String &source, float minValue, float maxValue) {
+        if (!source.length())
+            return false;
+        float parsed = source.toFloat();
+        if (parsed < minValue)
+            parsed = minValue;
+        if (parsed > maxValue)
+            parsed = maxValue;
+        if (fabsf(parsed - target) > 0.0005f)
+        {
+            target = parsed;
+            PortalSecurity::appendChangedField(changedFields, fieldName, true);
+            return true;
+        }
+        return false;
+    };
+
+    changed |= updateFloat("openRadiationLatitude", config_.openRadiationLatitude, latStr, -90.0f, 90.0f);
+    changed |= updateFloat("openRadiationLongitude", config_.openRadiationLongitude, lonStr, -180.0f, 180.0f);
+    if (altStr.length())
+    {
+        float parsedAlt = altStr.toFloat();
+        if (fabsf(parsedAlt - config_.openRadiationAltitude) > 0.05f)
+        {
+            config_.openRadiationAltitude = parsedAlt;
+            PortalSecurity::appendChangedField(changedFields, "openRadiationAltitude", true);
+            changed = true;
+        }
+    }
+    if (accStr.length())
+    {
+        float parsedAcc = accStr.toFloat();
+        if (parsedAcc < 0.0f)
+            parsedAcc = 0.0f;
+        if (fabsf(parsedAcc - config_.openRadiationAccuracy) > 0.05f)
+        {
+            config_.openRadiationAccuracy = parsedAcc;
+            PortalSecurity::appendChangedField(changedFields, "openRadiationAccuracy", true);
+            changed = true;
+        }
+    }
+
+    if (!environmentStr.length())
+    {
+        fieldChanged = UpdateStringIfChanged(config_.openRadiationMeasurementEnvironment, "");
+        PortalSecurity::appendChangedField(changedFields, "openRadiationMeasurementEnvironment", fieldChanged);
+        changed |= fieldChanged;
+    }
+    else if (OpenRadiationMeasurementMetadata::isValidMeasurementEnvironment(environmentStr))
+    {
+        fieldChanged = UpdateStringIfChanged(config_.openRadiationMeasurementEnvironment, environmentStr.c_str());
+        PortalSecurity::appendChangedField(changedFields, "openRadiationMeasurementEnvironment", fieldChanged);
+        changed |= fieldChanged;
+    }
+    else
+    {
+        log_.println("OpenRadiation: invalid measurementEnvironment ignored.");
+    }
+
+    if (measurementHeightStr.length())
+    {
+        const char *rawHeight = measurementHeightStr.c_str();
+        char *endHeight = nullptr;
+        float parsedMeasurementHeight = strtof(rawHeight, &endHeight);
+        if (endHeight == rawHeight || !endHeight || *endHeight != '\0' || !std::isfinite(parsedMeasurementHeight))
+        {
+            log_.println("OpenRadiation: invalid measurementHeight ignored.");
+        }
+        else
+        {
+            parsedMeasurementHeight = OpenRadiationMeasurementMetadata::clampMeasurementHeight(parsedMeasurementHeight);
+            if (fabsf(parsedMeasurementHeight - config_.openRadiationMeasurementHeight) > 0.05f)
+            {
+                config_.openRadiationMeasurementHeight = parsedMeasurementHeight;
+                PortalSecurity::appendChangedField(changedFields, "openRadiationMeasurementHeight", true);
+                changed = true;
+            }
+        }
+    }
+
+    String message;
+    if (changed)
+    {
+        if (store_.save(config_))
+        {
+            logConfigSave("/openradiation", changedFields);
+            led_.clearFault(FaultCode::NvsWriteFailure);
+            message = F("OpenRadiation settings saved.");
+        }
+        else
+        {
+            PortalSecurity::logConfigSaveFailure(log_, "/openradiation", currentClientIp(), changedFields);
+            log_.println("Preferences write failed; OpenRadiation configuration not saved.");
+            led_.activateFault(FaultCode::NvsWriteFailure);
+            message = F("Failed to save settings.");
+        }
+    }
+    else
+    {
+        message = F("No changes detected.");
+    }
+
+    sendOpenRadiationForm(message);
+}
+
+void WiFiPortalService::handleOpenRadiationDryRun()
+{
+    if (!activeServer())
+        return;
+
+    String payload;
+    String error;
+    if (!buildOpenRadiationDryRunPayload(config_, deviceInfo_.snapshot(), payload, error))
+    {
+        JsonDocument doc;
+        doc["error"] = String("OpenRadiation dry-run unavailable: ") + error;
+        String body;
+        serializeJsonPretty(doc, body);
+        activeServer()->send(503, "application/json", body);
+        return;
+    }
+
+    activeServer()->send(200, "application/json", payload);
+}
+
+void WiFiPortalService::handleOpenRadiationLatest()
+{
+    if (!activeServer())
+        return;
+
+    const String reportUuid = openRadiationHealth_.snapshot().lastReportUuid;
+    if (!reportUuid.length())
+    {
+        OpenRadiationPortalView::LatestMeasurementViewModel model;
+        model.errorMessage = "No successful OpenRadiation publish has been recorded yet.";
+        activeServer()->send(404, "text/html", OpenRadiationPortalView::buildLatestMeasurementPage(model));
+        return;
+    }
+
+    const String requestPath = OpenRadiationProtocol::buildMeasurementLookupPath(reportUuid, config_.openRadiationApiKey);
+    if (!requestPath.length())
+    {
+        OpenRadiationPortalView::LatestMeasurementViewModel model;
+        model.errorMessage = "OpenRadiation lookup is unavailable because the API key or report UUID is missing.";
+        activeServer()->send(503, "text/html", OpenRadiationPortalView::buildLatestMeasurementPage(model));
+        return;
+    }
+
+    WiFiClientSecure client;
+    client.setTimeout(15);
+    client.setInsecure();
+
+    if (!client.connect(OpenRadiationProtocol::kRequestHost, 443))
+    {
+        OpenRadiationPortalView::LatestMeasurementViewModel model;
+        model.errorMessage = "Could not connect to request.openradiation.net.";
+        activeServer()->send(502, "text/html", OpenRadiationPortalView::buildLatestMeasurementPage(model));
+        return;
+    }
+
+    String request;
+    request.reserve(requestPath.length() + 200);
+    request += "GET ";
+    request += requestPath;
+    request += " HTTP/1.1\r\nHost: ";
+    request += OpenRadiationProtocol::kRequestHost;
+    request += "\r\nConnection: close\r\nAccept: ";
+    request += OpenRadiationProtocol::kAccept;
+    request += "\r\nUser-Agent: RadPro-WiFi-Bridge/";
+    request += BRIDGE_FIRMWARE_VERSION;
+    request += "\r\n\r\n";
+
+    if (client.print(request) != request.length())
+    {
+        OpenRadiationPortalView::LatestMeasurementViewModel model;
+        model.errorMessage = "Failed to send the OpenRadiation lookup request.";
+        activeServer()->send(502, "text/html", OpenRadiationPortalView::buildLatestMeasurementPage(model));
+        return;
+    }
+
+    const auto response = HttpPublishResponse::readStatus(
+        client,
+        15000,
+        []() { return millis(); },
+        []() {
+            delay(10);
+            yield();
+        });
+
+    const String body = readHttpsBody(client, 1500, 2048);
+    if (!response.success)
+    {
+        OpenRadiationPortalView::LatestMeasurementViewModel model;
+        model.errorMessage = "OpenRadiation lookup failed with HTTP ";
+        model.errorMessage += String(response.statusCode);
+        model.errorMessage += ".";
+        if (body.length())
+        {
+            model.errorMessage += " Response: ";
+            model.errorMessage += body;
+        }
+        activeServer()->send(response.statusCode == 404 ? 404 : 502, "text/html", OpenRadiationPortalView::buildLatestMeasurementPage(model));
+        return;
+    }
+
+    JsonDocument doc;
+    const DeserializationError error = deserializeJson(doc, body);
+    JsonObject data = doc["data"].as<JsonObject>();
+    if (error || data.isNull())
+    {
+        OpenRadiationPortalView::LatestMeasurementViewModel model;
+        model.errorMessage = "OpenRadiation lookup returned an unexpected JSON payload.";
+        activeServer()->send(502, "text/html", OpenRadiationPortalView::buildLatestMeasurementPage(model));
+        return;
+    }
+
+    OpenRadiationPortalView::LatestMeasurementViewModel model;
+    model.reportUuid = data["reportUuid"] | reportUuid;
+    model.startTime = data["startTime"] | String();
+    model.valueText = String(data["value"] | 0.0f, 4) + " uSv/h";
+    model.qualification = data["qualification"] | String();
+    model.atypical = data["atypical"] | false;
+
+    const float latitude = data["latitude"] | config_.openRadiationLatitude;
+    const float longitude = data["longitude"] | config_.openRadiationLongitude;
+    model.mapUrl = OpenRadiationPortalLinks::buildOpenRadiationMapUrl(latitude, longitude);
+
+    activeServer()->send(200, "text/html", OpenRadiationPortalView::buildLatestMeasurementPage(model));
+}
+
+String WiFiPortalService::htmlEscape(const String &value)
+{
+    String out;
+    out.reserve(value.length());
+    for (size_t i = 0; i < value.length(); ++i)
+    {
+        char c = value[i];
+        switch (c)
+        {
+        case '&':
+            out += F("&amp;");
+            break;
+        case '<':
+            out += F("&lt;");
+            break;
+        case '>':
+            out += F("&gt;");
+            break;
+        case '"':
+            out += F("&quot;");
+            break;
+        case '\'':
+            out += F("&#39;");
+            break;
+        default:
+            out += c;
+            break;
+        }
+    }
+    return out;
+}
+
+bool WiFiPortalService::readFile(const char *path, String &out)
+{
+    bool fsAvailable = true;
+    File file = LittleFS.open(path, "r");
+    if (!file)
+    {
+        fsAvailable = remountLittleFsIfNeeded(path);
+        if (fsAvailable)
+            file = LittleFS.open(path, "r");
+    }
+    if (!file)
+    {
+        log_.print(F("Missing portal asset: "));
+        log_.println(path);
+        if (fsAvailable)
+        {
+            log_.print(F("LittleFS.exists? "));
+            log_.println(LittleFS.exists(path) ? F("yes") : F("no"));
+            dumpFilesystemContents(F("on missing asset"));
+        }
+        else
+        {
+            log_.println(F("LittleFS unavailable; cannot enumerate assets."));
+        }
+        return false;
+    }
+
+    log_.print(F("Serving asset: "));
+    log_.print(path);
+    log_.print(F(" size="));
+    log_.println(file.size());
+
+    out.clear();
+    out.reserve(file.size() + 8);
+    while (file.available())
+    {
+        out += static_cast<char>(file.read());
+    }
+    file.close();
+    return true;
+}
+
+bool WiFiPortalService::sendStaticFile(const char *path, const char *contentType)
+{
+    if (!activeServer())
+        return false;
+
+    File file = LittleFS.open(path, "r");
+    if (!file)
+    {
+        if (!remountLittleFsIfNeeded(path))
+            return false;
+        file = LittleFS.open(path, "r");
+    }
+
+    if (!file)
+    {
+        log_.print(F("Missing portal asset: "));
+        log_.println(path);
+        log_.print(F("LittleFS.exists? "));
+        log_.println(LittleFS.exists(path) ? F("yes") : F("no"));
+        return false;
+    }
+
+    log_.print(F("Serving asset: "));
+    log_.print(path);
+    log_.print(F(" size="));
+    log_.println(file.size());
+
+    size_t sent = activeServer()->streamFile(file, contentType);
+    file.close();
+
+    if (sent == 0)
+    {
+        log_.print(F("Failed to stream asset: "));
+        log_.println(path);
+        return false;
+    }
+
+    log_.print(F("Served asset: "));
+    log_.print(path);
+    log_.print(F(" bytes="));
+    log_.println(sent);
+    return true;
+}
+
+void WiFiPortalService::applyTemplateReplacements(String &content, const TemplateReplacements &replacements)
+{
+    for (const auto &entry : replacements)
+    {
+        content.replace(entry.first, entry.second);
+    }
+}
+
+bool WiFiPortalService::sendTemplate(const char *path, const TemplateReplacements &replacements)
+{
+    if (!activeServer())
+    {
+        log_.print(F("Cannot send template "));
+        log_.print(path);
+        log_.println(F(": web server not ready."));
+        return false;
+    }
+
+    String content;
+    if (!readFile(path, content))
+    {
+        log_.print(F("Retrying template load: "));
+        log_.println(path);
+        // Attempt to reload the menu snippet in case LittleFS mounted late.
+        if (strcmp(path, "/portal/menu.html") == 0)
+        {
+            menuHtml_ = String();
+            ensureMenuHtmlLoaded();
+            content = menuHtml_;
+        }
+
+        if (!content.length())
+        {
+            sendTemplateError(path);
+            return false;
+        }
+    }
+
+    applyTemplateReplacements(content, replacements);
+
+    activeServer()->send(200, "text/html", content);
+    log_.print(F("Served template OK: "));
+    log_.println(path);
+    return true;
+}
+
+String WiFiPortalService::resolvePortalLocale() const
+{
+    DeviceInfoSnapshot snap = deviceInfo_.snapshot();
+    String locale = snap.locale;
+    locale.trim();
+    locale.toLowerCase();
+    if (locale.startsWith("de"))
+        return "de";
+    return "en";
+}
+
+void WiFiPortalService::appendCommonTemplateVars(TemplateReplacements &replacements)
+{
+    ensureCsrfToken();
+    String locale = resolvePortalLocale();
+    replacements.emplace_back("{{LOCALE}}", locale);
+    replacements.emplace_back("{{CSRF_TOKEN}}", csrfToken_);
+}
+
+String WiFiPortalService::generateCsrfToken() const
+{
+    char buffer[33];
+    const uint32_t a = esp_random();
+    const uint32_t b = esp_random();
+    const uint32_t c = esp_random();
+    const uint32_t d = esp_random();
+    snprintf(buffer,
+             sizeof(buffer),
+             "%08lx%08lx%08lx%08lx",
+             static_cast<unsigned long>(a),
+             static_cast<unsigned long>(b),
+             static_cast<unsigned long>(c),
+             static_cast<unsigned long>(d));
+    return String(buffer);
+}
+
+void WiFiPortalService::ensureCsrfToken()
+{
+    if (!csrfToken_.length())
+        csrfToken_ = generateCsrfToken();
+}
+
+String WiFiPortalService::csrfHiddenInput() const
+{
+    String html = F("<input type=\"hidden\" name=\"csrf\" value=\"");
+    html += htmlEscape(csrfToken_);
+    html += F("\" />");
+    return html;
+}
+
+String WiFiPortalService::currentClientIp() const
+{
+    if (!activeServer())
+        return String();
+    return activeServer()->client().remoteIP().toString();
+}
+
+void WiFiPortalService::rejectPortalPost(const char *route, int code, const String &message, bool jsonResponse)
+{
+    if (!activeServer())
+        return;
+
+    log_.print(F("Rejected POST "));
+    log_.print(route ? route : "<unknown>");
+    log_.print(F(" from "));
+    log_.print(currentClientIp().length() ? currentClientIp() : String("<unknown>"));
+    log_.print(F(": "));
+    log_.println(message);
+
+    if (jsonResponse)
+    {
+        JsonDocument doc;
+        doc["error"] = message;
+        String body;
+        serializeJson(doc, body);
+        sendJson(code, body);
+        return;
+    }
+
+    activeServer()->send(code, "text/plain", message + "\n");
+}
+
+bool WiFiPortalService::requirePortalPost(const char *route,
+                                          std::initializer_list<const char *> requiredFields,
+                                          bool jsonResponse)
+{
+    if (!activeServer())
+        return false;
+
+    ensureCsrfToken();
+    auto &server = *activeServer();
+
+    std::vector<const char *> expected;
+    expected.reserve(requiredFields.size() + 1);
+    expected.emplace_back(PortalSecurity::kCsrfFieldName);
+    for (const char *field : requiredFields)
+        expected.emplace_back(field);
+
+    std::vector<String> present;
+    present.reserve(server.args());
+    for (uint8_t i = 0; i < server.args(); ++i)
+        present.emplace_back(server.argName(i));
+
+    const std::vector<String> missing = PortalSecurity::missingRequiredFields(expected, present);
+    if (!missing.empty())
+    {
+        rejectPortalPost(route,
+                         400,
+                         String(F("Missing required POST field(s): ")) + PortalSecurity::joinFieldNames(missing),
+                         jsonResponse);
+        return false;
+    }
+
+    if (!PortalSecurity::isValidCsrfToken(server.arg(PortalSecurity::kCsrfFieldName), csrfToken_))
+    {
+        rejectPortalPost(route, 403, F("Invalid CSRF token."), jsonResponse);
+        return false;
+    }
+
+    // Filesystem OTA and settings/restart actions must not interfere with a detector flash.
+    if (radProUpdater_ &&
+        ((radProUpdater_->ownsUsb() && !String(route).startsWith("/radpro-update/")) ||
+         (radProUpdater_->blocksBridgeUpdate() && String(route).startsWith("/ota/"))))
+    {
+        rejectPortalPost(route, 409, "Finish or cancel the detector update first.", jsonResponse);
+        return false;
+    }
+
+    return true;
+}
+
+void WiFiPortalService::logConfigSave(const char *route, const std::vector<String> &changedFields)
+{
+    PortalSecurity::logConfigSave(log_, route, currentClientIp(), changedFields);
+}
+
+std::vector<String> WiFiPortalService::collectChangedConfigFields(const AppConfig &before, const AppConfig &after) const
+{
+    std::vector<String> changed;
+
+#define RADPRO_APPEND_CHANGED_FIELD(field) PortalSecurity::appendChangedField(changed, #field, before.field != after.field)
+    RADPRO_APPEND_CHANGED_FIELD(deviceName);
+    RADPRO_APPEND_CHANGED_FIELD(mqttEnabled);
+    RADPRO_APPEND_CHANGED_FIELD(mqttHost);
+    RADPRO_APPEND_CHANGED_FIELD(mqttPort);
+    RADPRO_APPEND_CHANGED_FIELD(mqttClient);
+    RADPRO_APPEND_CHANGED_FIELD(mqttUser);
+    RADPRO_APPEND_CHANGED_FIELD(mqttPassword);
+    RADPRO_APPEND_CHANGED_FIELD(mqttTopic);
+    RADPRO_APPEND_CHANGED_FIELD(mqttFullTopic);
+    RADPRO_APPEND_CHANGED_FIELD(readIntervalMs);
+    RADPRO_APPEND_CHANGED_FIELD(usbRecoveryTimeoutSeconds);
+    RADPRO_APPEND_CHANGED_FIELD(openSenseMapEnabled);
+    RADPRO_APPEND_CHANGED_FIELD(openSenseBoxId);
+    RADPRO_APPEND_CHANGED_FIELD(openSenseApiKey);
+    RADPRO_APPEND_CHANGED_FIELD(openSenseTubeRateSensorId);
+    RADPRO_APPEND_CHANGED_FIELD(openSenseDoseRateSensorId);
+    RADPRO_APPEND_CHANGED_FIELD(gmcMapEnabled);
+    RADPRO_APPEND_CHANGED_FIELD(gmcMapAccountId);
+    RADPRO_APPEND_CHANGED_FIELD(gmcMapDeviceId);
+    RADPRO_APPEND_CHANGED_FIELD(radmonEnabled);
+    RADPRO_APPEND_CHANGED_FIELD(radmonUser);
+    RADPRO_APPEND_CHANGED_FIELD(radmonPassword);
+    RADPRO_APPEND_CHANGED_FIELD(openRadiationEnabled);
+    RADPRO_APPEND_CHANGED_FIELD(openRadiationDeviceId);
+    RADPRO_APPEND_CHANGED_FIELD(openRadiationApiKey);
+    RADPRO_APPEND_CHANGED_FIELD(openRadiationUserId);
+    RADPRO_APPEND_CHANGED_FIELD(openRadiationUserPassword);
+    RADPRO_APPEND_CHANGED_FIELD(openRadiationMeasurementEnvironment);
+    RADPRO_APPEND_CHANGED_FIELD(openRadiationMeasurementHeight);
+    RADPRO_APPEND_CHANGED_FIELD(openRadiationLatitude);
+    RADPRO_APPEND_CHANGED_FIELD(openRadiationLongitude);
+    RADPRO_APPEND_CHANGED_FIELD(openRadiationAltitude);
+    RADPRO_APPEND_CHANGED_FIELD(openRadiationAccuracy);
+    RADPRO_APPEND_CHANGED_FIELD(safecastEnabled);
+    RADPRO_APPEND_CHANGED_FIELD(safecastApiBaseUrl);
+    RADPRO_APPEND_CHANGED_FIELD(safecastUseTestApi);
+    RADPRO_APPEND_CHANGED_FIELD(safecastCustomApiBaseUrl);
+    RADPRO_APPEND_CHANGED_FIELD(safecastApiKey);
+    RADPRO_APPEND_CHANGED_FIELD(safecastDeviceId);
+    RADPRO_APPEND_CHANGED_FIELD(safecastLatitude);
+    RADPRO_APPEND_CHANGED_FIELD(safecastLongitude);
+    RADPRO_APPEND_CHANGED_FIELD(safecastHeightCm);
+    RADPRO_APPEND_CHANGED_FIELD(safecastLocationName);
+    RADPRO_APPEND_CHANGED_FIELD(safecastUnit);
+    RADPRO_APPEND_CHANGED_FIELD(safecastUploadIntervalSeconds);
+    RADPRO_APPEND_CHANGED_FIELD(safecastDebug);
+#undef RADPRO_APPEND_CHANGED_FIELD
+
+    return changed;
+}
+
+void WiFiPortalService::handleLogsJson()
+{
+    if (!activeServer())
+        return;
+
+    uint32_t afterId = 0;
+    if (activeServer()->hasArg("after"))
+        afterId = static_cast<uint32_t>(strtoul(activeServer()->arg("after").c_str(), nullptr, 10));
+
+    std::vector<DebugLogEntry> entries;
+    log_.copyEntries(entries);
+    const auto window = LogCursorWindow::select(entries, afterId);
+
+    JsonDocument doc;
+    JsonArray lines = doc["lines"].to<JsonArray>();
+    for (size_t i = window.startIndex; i < entries.size(); ++i)
+    {
+        const auto &entry = entries[i];
+        lines.add(entry.text);
+        if (doc.overflowed())
+            break;
+    }
+    doc["count"] = static_cast<uint32_t>(entries.size());
+    doc["returnedCount"] = static_cast<uint32_t>(lines.size());
+    doc["oldest"] = window.oldestId;
+    doc["latest"] = log_.latestId();
+    doc["reset"] = window.reset;
+
+    String body;
+    serializeJson(doc, body);
+    activeServer()->send(200, "application/json", body);
+}
+
+void WiFiPortalService::sendTemplateError(const char *path)
+{
+    if (!activeServer())
+    {
+        log_.print(F("Cannot send template error for "));
+        log_.print(path);
+        log_.println(F(" because server is null."));
+        return;
+    }
+    String body = String(F("Template not found: ")) + path;
+    activeServer()->send(500, "text/plain", body);
+    log_.print(F("Sent template error response for "));
+    log_.println(path);
+}
+
+bool WiFiPortalService::remountLittleFsIfNeeded(const char *context)
+{
+    log_.print(F("LittleFS unavailable while accessing "));
+    log_.print(context);
+    log_.println(F("; attempting remount."));
+    if (LittleFS.begin(false, BridgeFileSystem::kBasePath, BridgeFileSystem::kMaxFiles, BridgeFileSystem::kLabel))
+    {
+        log_.println(F("LittleFS remount successful."));
+        dumpFilesystemContents(F("after remount"));
+        return true;
+    }
+    log_.println(F("LittleFS remount failed."));
+    return false;
+}
+
+void WiFiPortalService::dumpFilesystemContents(const __FlashStringHelper *reason)
+{
+    BridgeFileSystem::dumpTree(log_, reason);
+}
+
+void WiFiPortalService::ensureMenuHtmlLoaded()
+{
+    log_.println(F("ensureMenuHtmlLoaded(): checking cached menu HTML…"));
+    if (menuHtml_.length())
+    {
+        log_.println(F("Menu HTML already loaded."));
+        return;
+    }
+    log_.print(F("ensureMenuHtmlLoaded(): loading /portal/menu.html (exists? "));
+    log_.print(LittleFS.exists("/portal/menu.html") ? F("yes") : F("no"));
+    log_.println(F(")"));
+    if (!readFile("/portal/menu.html", menuHtml_))
+    {
+        log_.println(F("Failed to load /portal/menu.html"));
+    }
+    else
+    {
+        log_.print(F("Loaded menu HTML ("));
+        log_.print(menuHtml_.length());
+        log_.println(F(" bytes)."));
+        if (paramsAttached_)
+        {
+            log_.println(F("Re-applying custom menu HTML to WiFiManager."));
+            applyMenuHtmlForLocale(resolvePortalLocale());
+        }
+    }
+}
+
+void WiFiPortalService::applyMenuHtmlForLocale(const String &locale)
+{
+    if (!menuHtml_.length())
+        return;
+
+    if (menuHtmlLocale_ == locale && menuHtmlRendered_.length())
+    {
+        manager_.setCustomMenuHTML(menuHtmlRendered_.c_str());
+        return;
+    }
+
+    menuHtmlRendered_ = menuHtml_;
+    menuHtmlRendered_.replace("{{PORTAL_LOCALE}}", locale);
+    menuHtmlLocale_ = locale;
+
+    manager_.setCustomMenuHTML(menuHtmlRendered_.c_str());
+}
