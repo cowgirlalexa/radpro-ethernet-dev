@@ -1,0 +1,54 @@
+<!--
+SPDX-FileCopyrightText: 2026 André Fiedler
+
+SPDX-License-Identifier: GPL-3.0-or-later
+-->
+
+<!DOCTYPE html>
+<html lang="{{LOCALE}}">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width,initial-scale=1" />
+        <title>Configure OpenSenseMap</title>
+        <link rel="stylesheet" href="/portal/portal.css" />
+        <link rel="icon" href="/favicon.ico" sizes="16x16 32x32 48x48" />
+        <link rel="icon" href="/portal/icon.svg" type="image/svg+xml" sizes="any" />
+        <link rel="apple-touch-icon" href="/portal/apple-touch-icon.png" />
+        <link rel="mask-icon" href="/portal/safari-pinned-tab.svg" color="#b87813" />
+    </head>
+    <body class="invert" data-i18n-title="T_MENU_CONFIGURE_OSEM" data-portal-locale-value="{{LOCALE}}">
+        <div class="wrap wrap--compact">
+            <h1 data-i18n="T_SECTION_OSEM_SETTINGS">OpenSenseMap Settings</h1>
+            <p class="notice {{NOTICE_CLASS}}">{{NOTICE_TEXT}}</p>
+            <form method="POST" action="/osem">
+                <input type="hidden" name="csrf" value="{{CSRF_TOKEN}}" />
+                <label class="toggle">
+                    <input id="osemEnabled" name="osemEnabled" type="checkbox" value="1" {{OSEM_ENABLED_CHECKED}} />
+                    <span data-i18n="T_OSEM_ENABLE">Enable OpenSenseMap publishing</span>
+                </label>
+                <label for="osemBoxId" data-i18n="T_LABEL_BOX_ID">Box ID</label>
+                <input id="osemBoxId" name="osemBoxId" type="text" value="{{OSEM_BOX_ID}}" />
+                <p class="field-link {{OSEM_BOX_LINK_CLASS}}">
+                    <a href="{{OSEM_BOX_URL}}" target="_blank" rel="noopener noreferrer" data-i18n="T_OSEM_OPEN_BOX">Open box in OpenSenseMap</a>
+                </p>
+                <label for="osemApiKey" data-i18n="T_LABEL_ACCESS_TOKEN">Access Token</label>
+                <input id="osemApiKey" name="osemApiKey" type="text" value="{{OSEM_API_KEY}}" />
+                <label for="osemRate" data-i18n="T_LABEL_RATE_SENSOR">Tube Rate (cpm) - Geiger Sensor ID</label>
+                <input id="osemRate" name="osemRate" type="text" value="{{OSEM_RATE_ID}}" />
+                <p class="field-link {{OSEM_RATE_SETTINGS_CLASS}}">
+                    <a href="{{OSEM_RATE_SETTINGS_URL}}" target="_blank" rel="noopener noreferrer" data-i18n="T_OSEM_OPEN_SENSOR_SETTINGS">Open sensor settings in OpenSenseMap</a>
+                </p>
+                <label for="osemDose" data-i18n="T_LABEL_DOSE_SENSOR">Dose Rate (µSv/h) - Dose Sensor ID</label>
+                <input id="osemDose" name="osemDose" type="text" value="{{OSEM_DOSE_ID}}" />
+                <p class="field-link {{OSEM_DOSE_SETTINGS_CLASS}}">
+                    <a href="{{OSEM_DOSE_SETTINGS_URL}}" target="_blank" rel="noopener noreferrer" data-i18n="T_OSEM_OPEN_SENSOR_SETTINGS">Open sensor settings in OpenSenseMap</a>
+                </p>
+                <button type="submit" data-i18n="T_BUTTON_SAVE_OSEM">Save OpenSenseMap Settings</button>
+            </form>
+            <form action="/" method="get" class="back-form">
+                <button type="submit" data-i18n="T_BUTTON_BACK">Back to Main Menu</button>
+            </form>
+        </div>
+        <script src="/portal/portal-locale.js"></script>
+    </body>
+</html>
